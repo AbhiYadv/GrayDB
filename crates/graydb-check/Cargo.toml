@@ -1,0 +1,53 @@
+[package]
+name = "graydb-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+graydb-columnar = { path = "../graydb-columnar" }
+graydb-ingest = { path = "../graydb-ingest" }
+graydb-log = { path = "../graydb-log" }
+graydb-registry = { path = "../graydb-registry" }
+graydb-search = { path = "../graydb-search" }
+graydb-studio = { path = "../graydb-studio" }
+arrow = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[[bin]]
+name = "demo-sp1"
+path = "src/bin/demo-sp1.rs"
+
+[[bin]]
+name = "demo-sp2"
+path = "src/bin/demo-sp2.rs"
+
+[[bin]]
+name = "demo-sp3"
+path = "src/bin/demo-sp3.rs"
+
+[[bin]]
+name = "demo-sp4"
+path = "src/bin/demo-sp4.rs"
+
+[[bin]]
+name = "demo-sp5"
+path = "src/bin/demo-sp5.rs"
+
+[[bin]]
+name = "demo-sp6"
+path = "src/bin/demo-sp6.rs"
+
+[[bin]]
+name = "demo-sp7"
+path = "src/bin/demo-sp7.rs"
+
+[[bin]]
+name = "bench-cdc"
+path = "src/bin/bench-cdc.rs"

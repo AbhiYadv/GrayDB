@@ -1,0 +1,21 @@
+# Build output (23 GB — never commit)
+target/
+dist/
+
+# Derived data: every byte is rebuildable from snapshot + log replay (invariant I3)
+data/
+bench-results/
+*.parquet
+
+# Secrets and local overrides
+.env
+graydb.local.toml
+
+# Run logs / scratch
+*.log
+build-*.txt
+check-*.txt
+err*.txt
+sp7-run*.log
+studio-run.log
+package-run.log

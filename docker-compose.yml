@@ -1,0 +1,43 @@
+# Local dev sources — Postgres 16 AND 17, wal_level=logical (CLAUDE.md working rule: test both).
+services:
+  pg16:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    environment:
+      POSTGRES_PASSWORD: graydb
+      POSTGRES_DB: appdb
+    ports:
+      - "5416:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  pg17:
+    image: postgres:17
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    environment:
+      POSTGRES_PASSWORD: graydb
+      POSTGRES_DB: appdb
+    ports:
+      - "5417:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

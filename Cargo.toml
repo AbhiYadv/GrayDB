@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/graydb-ingest",
+  "crates/graydb-log",
+  "crates/graydb-registry",
+  "crates/graydb-columnar",
+  "crates/graydb-search",
+  "crates/graydb-check",
+  "crates/graydb-studio",
+]
+
+# Performance posture: any number we quote comes from --release with these opts.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+postgres-protocol = "0.6"
+futures-util = "0.3"
+async-trait = "0.1"
+bytes = "1"
+crc32c = "0.6"
+md5 = "0.7"
+anyhow = "1"
+thiserror = "1"
+# arrow/parquet 58 = what datafusion 54 (SP6 reader) pins; aligned now to avoid a fork later
+arrow = "58"
+parquet = { version = "58", features = ["arrow", "zstd"] }
+datafusion = "54"
+axum = "0.8"
+roaring = "0.11"
+tantivy = "0.26"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"

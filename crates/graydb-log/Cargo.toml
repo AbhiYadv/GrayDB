@@ -1,0 +1,11 @@
+[package]
+name = "graydb-log"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GrayDB Studio</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#151a21; --line:#232a34; --fg:#d7dee8; --dim:#8b98a9;
+    --accent:#5aa9e6; --ok:#5cc98b; --warn:#e3b341; --bad:#e5534b; --mono:ui-monospace,"Cascadia Mono",Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 var(--mono); }
+  header { display:flex; align-items:baseline; gap:16px; padding:10px 14px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:14px; letter-spacing:.5px; }
+  header .sub { color:var(--dim); font-size:12px; }
+  .grid { display:grid; grid-template-columns: 340px 1fr; gap:12px; padding:12px; align-items:start; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:4px; }
+  .panel h2 { margin:0; padding:8px 10px; font-size:12px; text-transform:uppercase; letter-spacing:.8px;
+              color:var(--dim); border-bottom:1px solid var(--line); }
+  .panel .body { padding:10px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; }
+  .kv dt { color:var(--dim); }
+  .kv dd { margin:0; overflow-wrap:anywhere; }
+  button { background:#1d2430; color:var(--fg); border:1px solid var(--line); border-radius:3px;
+           padding:5px 9px; font:12px var(--mono); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.danger { border-color:#4a2b2b; }
+  button.danger:hover { border-color:var(--bad); color:#ffd9d6; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; }
+  textarea, select, input { background:#0b0e13; color:var(--fg); border:1px solid var(--line);
+                            border-radius:3px; font:12px var(--mono); padding:6px; width:100%; }
+  textarea { min-height:88px; resize:vertical; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th, td { border-bottom:1px solid var(--line); padding:4px 6px; text-align:left; white-space:nowrap; }
+  th { color:var(--dim); font-weight:normal; position:sticky; top:0; background:var(--panel); }
+  .scroll { max-height:340px; overflow:auto; }
+  .proof { margin-top:8px; padding:6px 8px; border:1px dashed var(--line); border-radius:3px;
+           color:var(--accent); font-size:12px; overflow-wrap:anywhere; }
+  .gauge { height:14px; background:#0b0e13; border:1px solid var(--line); border-radius:3px; overflow:hidden; }
+  .gauge > div { height:100%; background:var(--ok); width:0%; transition:width .3s; }
+  .rung1 > div { background:var(--warn); } .rung2 > div { background:var(--bad); }
+  .ev { display:grid; grid-template-columns:64px 52px 1fr; gap:6px; padding:2px 0; border-bottom:1px solid #1b212a; }
+  .ev .lvl { color:var(--dim); } .ev.warn .lvl { color:var(--warn); } .ev.error .lvl { color:var(--bad); }
+  .pill { padding:1px 6px; border:1px solid var(--line); border-radius:9px; font-size:11px; color:var(--dim); }
+  .pill.on { color:var(--ok); border-color:#26543c; } .pill.off { color:var(--bad); border-color:#4a2b2b; }
+  .note { color:var(--dim); font-size:11px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GrayDB Studio</h1>
+  <span class="sub">derived database for PostgreSQL — every query proves its LSN</span>
+  <span id="attached" class="pill off">detached</span>
+  <span id="pump" class="pill off">decoder down</span>
+</header>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Attach</h2>
+      <div class="body">
+        <dl class="kv">
+          <dt>source</dt><dd id="s-source">-</dd>
+          <dt>version</dt><dd id="s-version">-</dd>
+          <dt>publication</dt><dd id="s-pub">-</dd>
+          <dt>slot</dt><dd id="s-slot">-</dd>
+          <dt>LSN0</dt><dd id="s-lsn0">-</dd>
+        </dl>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-attach">Attach + backfill</button>
+        </div>
+        <div class="note">Installs publication + graydb.ddl_log event triggers. SQL objects only — nothing is installed inside your database's binaries.</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+      <h2>Replication (graydb.stat_replication)</h2>
+      <div class="body">
+        <dl class="kv">
+          <dt>received_lsn</dt><dd id="s-recv">-</dd>
+          <dt>flushed_lsn</dt><dd id="s-flushed">-</dd>
+          <dt>applied_lsn</dt><dd id="s-applied">-</dd>
+          <dt>apply_lag</dt><dd id="s-lag">-</dd>
+          <dt>frames</dt><dd id="s-frames">-</dd>
+          <dt>commits</dt><dd id="s-commits">-</dd>
+          <dt>spilled</dt><dd id="s-spilled">-</dd>
+        </dl>
+        <div style="margin-top:10px">
+          <div style="display:flex;justify-content:space-between;color:var(--dim)">
+            <span>WAL retention budget</span><span id="s-walpct">0%</span>
+          </div>
+          <div id="gauge" class="gauge"><div></div></div>
+          <div class="note" id="s-walnote">rung 0 — healthy</div>
+          <div class="note">Retained WAL is released by the source's own slot bookkeeping: <code>restart_lsn</code> advances only when a commit flows after a standby snapshot, so the gauge falls once source write activity resumes — GrayDB never writes to your database to force it.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+      <h2>Chaos</h2>
+      <div class="body">
+        <div class="row">
+          <button class="danger" id="btn-kill">Kill decoder</button>
+          <button id="btn-restart">Restart from ack</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button class="danger" id="btn-stall">Stall log write path</button>
+          <button class="danger" id="btn-freeze">Freeze materialize</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button class="danger" id="btn-src">Crash-restart source</button>
+        </div>
+        <div class="note">Kill = dying session. Restart always opens a FRESH replication session from the last durable ack, so Postgres re-emits Relation metadata. Zero gap, zero duplicate.</div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Tables</h2>
+      <div class="body scroll">
+        <table>
+          <thead><tr><th>table</th><th>eligibility</th><th>columnar applied</th><th>search applied</th><th>rows visible</th></tr></thead>
+          <tbody id="tbl-tables"><tr><td colspan="5" style="color:var(--dim)">not attached</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+      <h2>SQL</h2>
+      <div class="body">
+        <textarea id="sql">SELECT status, count(*) AS n FROM app.orders GROUP BY status ORDER BY n DESC</textarea>
+        <div class="row" style="margin-top:8px; align-items:center">
+          <select id="class" style="max-width:260px">
+            <option value="eventual">eventual — never blocks</option>
+            <option value="bounded(5s)">bounded(5s) — fast error if stale</option>
+            <option value="strong">strong — source barrier, waits</option>
+            <option value="target_lsn">target_lsn = …</option>
+          </select>
+          <input id="lsn" placeholder="0/1FC3768" style="max-width:160px; display:none">
+          <button id="btn-run">Run</button>
+        </div>
+        <div class="proof" id="proof">LSN proof appears here on every result.</div>
+        <div class="scroll" style="margin-top:8px">
+          <table><thead id="res-head"></thead><tbody id="res-body"></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+      <h2>Events</h2>
+      <div class="body scroll" id="events" style="max-height:220px"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmtBytes = (n) => n >= 1<<30 ? (n/(1<<30)).toFixed(1)+" GiB"
+                    : n >= 1<<20 ? (n/(1<<20)).toFixed(1)+" MiB"
+                    : n >= 1024 ? (n/1024).toFixed(1)+" KiB" : n+" B";
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body) };
+  if (body === null) opt.method = "POST";
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+let stallOn = false, freezeOn = false;
+
+async function refresh() {
+  try {
+    const s = await api("/api/status");
+    $("attached").textContent = s.attached ? "attached" : "detached";
+    $("attached").className = "pill " + (s.attached ? "on" : "off");
+    $("pump").textContent = s.pump_alive ? (s.stalled ? "decoder stalled" : "decoder streaming") : "decoder down";
+    $("pump").className = "pill " + (s.pump_alive && !s.stalled ? "on" : "off");
+    $("s-source").textContent = s.source;
+    $("s-version").textContent = s.server_version;
+    $("s-pub").textContent = s.publication;
+    $("s-slot").textContent = s.slot;
+    $("s-lsn0").textContent = s.lsn0;
+    $("s-recv").textContent = s.received_lsn;
+    $("s-flushed").textContent = s.flushed_lsn;
+    $("s-applied").textContent = s.applied_lsn;
+    $("s-lag").textContent = fmtBytes(Math.max(0, s.apply_lag_bytes));
+    $("s-frames").textContent = s.frames;
+    $("s-commits").textContent = s.commits;
+    $("s-spilled").textContent = s.spilled_frames;
+    const pct = Math.min(100, s.wal_fraction * 100);
+    $("s-walpct").textContent = pct.toFixed(1) + "%";
+    $("gauge").className = "gauge" + (s.wal_rung === 2 ? " rung2" : s.wal_rung === 1 ? " rung1" : "");
+    $("gauge").firstElementChild.style.width = pct + "%";
+    $("s-walnote").textContent = "rung " + s.wal_rung + " — " +
+      (s.wal_rung === 0 ? "healthy" : s.wal_rung === 1 ? "warn (>=50% of budget)" : "shed (>=70% of budget)") +
+      " · retained " + fmtBytes(s.wal_retained_bytes) + " of " + fmtBytes(s.wal_budget_bytes);
+    $("tbl-tables").innerHTML = s.tables.length ? s.tables.map(t =>
+      `<tr><td>${t.table}</td><td>${t.eligibility}</td><td>${t.columnar_applied_lsn}</td>` +
+      `<td>${t.search_applied_lsn ?? "—"}</td><td>${t.rows_visible}</td></tr>`).join("")
+      : `<tr><td colspan="5" style="color:var(--dim)">not attached</td></tr>`;
+
+    const ev = await api("/api/events");
+    $("events").innerHTML = ev.map(e =>
+      `<div class="ev ${e.level}"><span>${e.at}</span><span class="lvl">${e.level}</span><span>${e.message}</span></div>`).join("");
+  } catch (e) { /* transient during attach/restart */ }
+}
+
+$("class").onchange = () => {
+  $("lsn").style.display = $("class").value === "target_lsn" ? "block" : "none";
+};
+
+$("btn-attach").onclick = async (ev) => {
+  ev.target.disabled = true; ev.target.textContent = "Attaching…";
+  try { await api("/api/attach", null); } catch (e) { alert("Attach failed: " + e.message); }
+  ev.target.disabled = false; ev.target.textContent = "Attach + backfill"; refresh();
+};
+
+$("btn-run").onclick = async () => {
+  const cls = $("class").value === "target_lsn" ? "target_lsn=" + $("lsn").value.trim() : $("class").value;
+  $("proof").textContent = "running…";
+  try {
+    const r = await api("/api/query", { sql: $("sql").value, class: cls });
+    $("res-head").innerHTML = "<tr>" + r.columns.map(c => `<th>${c}</th>`).join("") + "</tr>";
+    $("res-body").innerHTML = r.rows.map(row => "<tr>" + row.map(v => `<td>${v}</td>`).join("") + "</tr>").join("");
+    $("proof").textContent = r.proof + "   ·   " + r.rows.length + " row(s)";
+  } catch (e) {
+    $("res-head").innerHTML = ""; $("res-body").innerHTML = "";
+    $("proof").textContent = "error: " + e.message;
+  }
+};
+
+$("btn-kill").onclick = async () => { try { await api("/api/chaos/kill-decoder", null); } catch(e){ alert(e.message); } refresh(); };
+$("btn-restart").onclick = async () => { try { await api("/api/chaos/restart-decoder", null); } catch(e){ alert(e.message); } refresh(); };
+$("btn-stall").onclick = async (ev) => {
+  stallOn = !stallOn;
+  try { await api("/api/chaos/stall-log", { on: stallOn }); ev.target.textContent = stallOn ? "Resume log write path" : "Stall log write path"; }
+  catch(e){ stallOn = !stallOn; alert(e.message); }
+  refresh();
+};
+$("btn-freeze").onclick = async (ev) => {
+  freezeOn = !freezeOn;
+  try { await api("/api/chaos/freeze-materialize", { on: freezeOn }); ev.target.textContent = freezeOn ? "Resume materialize" : "Freeze materialize"; }
+  catch(e){ freezeOn = !freezeOn; alert(e.message); }
+  refresh();
+};
+$("btn-src").onclick = async (ev) => {
+  if (!confirm("Crash-restart the source PostgreSQL (-m immediate)?")) return;
+  ev.target.disabled = true;
+  try { await api("/api/chaos/restart-source", null); } catch(e){ alert(e.message); }
+  ev.target.disabled = false; refresh();
+};
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

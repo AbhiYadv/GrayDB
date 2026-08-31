@@ -1,0 +1,59 @@
+# GrayDB spike configuration.
+# Working rule: every magic number from the spec lives HERE with the spec default, never inline.
+# Env overrides honored by the loader: GRAYDB_SOURCE_HOST, GRAYDB_SOURCE_PORT, GRAYDB_SOURCE_PASSWORD.
+#
+# CREDENTIALS: the values below are throwaway credentials for the LOCAL demo database
+# created by scripts/local-pg.ps1. NEVER put real credentials in this file — it is
+# committed to the repo. For a real source, set GRAYDB_SOURCE_PASSWORD in the
+# environment, or copy this file to graydb.local.toml (gitignored) and point
+# GRAYDB_CONFIG at it.
+
+[source]
+host = "127.0.0.1"
+port = 5417                    # docker-compose: pg17 -> 5417, pg16 -> 5416 (test both, D-006)
+dbname = "appdb"
+user = "postgres"
+password = "graydb"
+schema = "app"                 # the one schema this spike backfills
+publication = "graydb_pub"
+slot = "graydb_slot"
+
+[initial_load]
+copy_streams = 8               # wedge spec section 5: 8 parallel streams example default
+read_budget_pct = 25           # spec section 5: 25-30% of source I/O headroom; lower bound default
+                               # (enforcement lands with SP2 pacing; recorded here from day one)
+
+[wal_budget]                   # WL5 / Amendment A section A3: min(50 GB, 4 h)
+bytes_cap = 53687091200        # 50 GiB (demo override: GRAYDB_WAL_BUDGET_BYTES)
+time_cap_secs = 14400          # 4 h
+warn_fraction = 0.5            # ladder rung 1 trips at >= 50% of budget
+shed_fraction = 0.7            # ladder rung 2 (shed nonessential work) at >= 70% (D-011)
+
+[log]                          # the durable LSN-ordered frame log (I2)
+segment_max_bytes = 67108864   # roll segments at 64 MiB, only at txn boundaries
+
+[columnar]                     # parquet segments + roaring delete bitmaps (SP4)
+flush_rows = 100000            # flush open segment at this many buffered rows (D-013)
+
+[search]                       # tantivy indexes (SP5): declared per table+columns,
+commit_batch_txns = 64         # committed in LSN batches, NEVER mid-transaction
+
+[[search.indexes]]
+table = "app.customers"
+columns = ["name", "email"]
+
+[[search.indexes]]
+table = "app.notes"
+columns = ["body"]
+
+[consistency]                  # Amendment A section A4
+session_default = "bounded(5)" # bounded(5s) is the session default
+heartbeat_secs = 1             # source heartbeat (pg_current_wal_lsn) sampling interval
+
+[retention]                    # Amendment A section A6
+historical_window_days = 7     # historical-LSN queries beyond this error explicitly
+base_refresh_fraction = 0.5    # re-snapshot when log-since-base > 0.5x table size
+base_refresh_days = 7          # ... OR base age > 7 d
+
+[storage]
+data_dir = "./data"            # staging + frame log root (object_store local-fs backend; S3/MinIO later)

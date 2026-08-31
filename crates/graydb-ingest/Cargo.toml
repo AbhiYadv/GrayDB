@@ -1,0 +1,19 @@
+[package]
+name = "graydb-ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+graydb-log = { path = "../graydb-log" }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+postgres-protocol = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+md5 = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }

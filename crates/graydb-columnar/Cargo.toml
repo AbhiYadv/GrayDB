@@ -1,0 +1,14 @@
+[package]
+name = "graydb-columnar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+graydb-registry = { path = "../graydb-registry" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "graydb-search"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+graydb-registry = { path = "../graydb-registry" }
+tantivy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
