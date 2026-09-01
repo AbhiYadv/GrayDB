@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 pub const COPY_BATCH_ROWS: u64 = 100_000;
@@ -131,22 +133,16 @@ impl DeterministicGenerator {
         match table {
             Table::Tenants => Row::Tenants {
                 tenant_id: id,
-                region: ["us-east", "us-west", "eu-west", "ap-south"]
-                    [(self.draw(table, id, 3) % 4) as usize]
-                    .into(),
-                plan: ["free", "pro", "enterprise"][(self.draw(table, id, 4) % 3) as usize].into(),
+                region: weighted_choice(self.draw(table, id, 3), &REGIONS).into(),
+                plan: weighted_choice(self.draw(table, id, 4), &PLANS).into(),
                 created_at: ts,
                 settings: json(self.draw(table, id, 5), "tenant"),
             },
             Table::Customers => Row::Customers {
                 customer_id: id,
                 tenant_id: tenant,
-                segment: ["consumer", "smb", "mid-market", "enterprise"]
-                    [(self.draw(table, id, 3) % 4) as usize]
-                    .into(),
-                email_domain: ["example.com", "mail.test", "corp.test", "acme.test"]
-                    [(self.draw(table, id, 4) % 4) as usize]
-                    .into(),
+                segment: weighted_choice(self.draw(table, id, 3), &SEGMENTS).into(),
+                email_domain: weighted_choice(self.draw(table, id, 4), &EMAIL_DOMAINS).into(),
                 profile: json(self.draw(table, id, 5), "customer"),
                 created_at: ts,
             },
@@ -156,14 +152,12 @@ impl DeterministicGenerator {
                     order_id: id,
                     tenant_id: tenant,
                     customer_id: selected_customer,
-                    status: ["pending", "paid", "shipped", "cancelled", "refunded"]
-                        [(self.draw(table, id, 3) % 5) as usize]
-                        .into(),
-                    channel: ["web", "mobile", "partner"][(self.draw(table, id, 4) % 3) as usize]
-                        .into(),
-                    amount_cents: 100
-                        + ((self.draw(table, id, 5) % 1_000) * (self.draw(table, id, 9) % 1_000))
-                            as i64,
+                    status: weighted_choice(self.draw(table, id, 3), &STATUSES).into(),
+                    channel: weighted_choice(self.draw(table, id, 4), &CHANNELS).into(),
+                    amount_cents: long_tailed_cents(
+                        self.draw(table, id, 5),
+                        self.draw(table, id, 9),
+                    ),
                     created_at: ts,
                     updated_at: updated,
                     attributes: json(self.draw(table, id, 8), "order"),
@@ -173,9 +167,7 @@ impl DeterministicGenerator {
                 event_id: id,
                 order_id: selected_order,
                 tenant_id: tenant,
-                event_type: ["created", "paid", "fulfilled", "cancelled", "returned"]
-                    [(self.draw(table, id, 4) % 5) as usize]
-                    .into(),
+                event_type: weighted_choice(self.draw(table, id, 4), &EVENT_TYPES).into(),
                 event_at: ts,
                 metadata: json(self.draw(table, id, 5), "event"),
             },
@@ -289,6 +281,70 @@ fn order_for_event(id: u64, draw: u64) -> u64 {
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+const REGIONS: [(&str, u64); 4] = [
+    ("us-east", 46),
+    ("us-west", 27),
+    ("eu-west", 18),
+    ("ap-south", 9),
+];
+const PLANS: [(&str, u64); 3] = [("free", 70), ("pro", 23), ("enterprise", 7)];
+const SEGMENTS: [(&str, u64); 4] = [
+    ("consumer", 55),
+    ("smb", 29),
+    ("mid-market", 12),
+    ("enterprise", 4),
+];
+const EMAIL_DOMAINS: [(&str, u64); 4] = [
+    ("example.com", 58),
+    ("mail.test", 25),
+    ("corp.test", 12),
+    ("acme.test", 5),
+];
+const STATUSES: [(&str, u64); 5] = [
+    ("paid", 46),
+    ("shipped", 27),
+    ("pending", 15),
+    ("cancelled", 8),
+    ("refunded", 4),
+];
+const CHANNELS: [(&str, u64); 3] = [("web", 61), ("mobile", 31), ("partner", 8)];
+const EVENT_TYPES: [(&str, u64); 5] = [
+    ("created", 42),
+    ("paid", 30),
+    ("fulfilled", 17),
+    ("cancelled", 7),
+    ("returned", 4),
+];
+
+fn weighted_choice<'a, const N: usize>(draw: u64, choices: &'a [(&'a str, u64); N]) -> &'a str {
+    let total = choices.iter().map(|(_, weight)| weight).sum::<u64>();
+    let mut slot = draw % total;
+    for (value, weight) in choices {
+        if slot < *weight {
+            return value;
+        }
+        slot -= weight;
+    }
+    unreachable!("non-empty weighted dictionary")
+}
+
+fn long_tailed_cents(bucket_draw: u64, value_draw: u64) -> i64 {
+    const BUCKETS: [(i64, i64, u64); 5] = [
+        (100, 2_499, 55),
+        (2_500, 9_999, 27),
+        (10_000, 49_999, 12),
+        (50_000, 249_999, 5),
+        (250_000, 2_000_000, 1),
+    ];
+    let mut slot = bucket_draw % 100;
+    for (low, high, weight) in BUCKETS {
+        if slot < weight {
+            return low + (value_draw % (high - low + 1) as u64) as i64;
+        }
+        slot -= weight;
+    }
+    unreachable!("long-tail buckets sum to 100")
+}
 pub fn mix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E3779B97F4A7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -302,8 +358,48 @@ fn escape(v: &str) -> String {
         .replace('\r', "\\r")
 }
 fn json(v: u64, k: &str) -> String {
-    let extra = "x".repeat((v % 32) as usize);
-    format!(r#"{{"{}":{},"version":1,"tag":"{}"}}"#, k, v % 1000, extra)
+    let mut tags = BTreeMap::new();
+    tags.insert("bucket".to_string(), Value::from((v % 8) as u64));
+    tags.insert(
+        "label".to_string(),
+        Value::from("x".repeat(json_label_len(v))),
+    );
+    let mut object = BTreeMap::new();
+    if k == "tenant" {
+        object.insert(
+            "activity_rank".to_string(),
+            Value::from(bounded_zipf_rank(v)),
+        );
+    }
+    object.insert("kind".to_string(), Value::from(k));
+    object.insert("payload".to_string(), Value::from(v % 1000));
+    object.insert("schema_version".to_string(), Value::from(1));
+    object.insert(
+        "tags".to_string(),
+        serde_json::to_value(tags).expect("JSON tags"),
+    );
+    serde_json::to_string(&object).expect("ordered JSON metadata")
+}
+fn bounded_zipf_rank(draw: u64) -> u64 {
+    const MAX_RANK: u64 = 64;
+    let total = (1..=MAX_RANK).map(|rank| 10_000 / rank).sum::<u64>();
+    let mut slot = draw % total;
+    for rank in 1..=MAX_RANK {
+        let weight = 10_000 / rank;
+        if slot < weight {
+            return rank;
+        }
+        slot -= weight;
+    }
+    unreachable!("bounded Zipf weights are non-empty")
+}
+fn json_label_len(v: u64) -> usize {
+    match v % 100 {
+        0..=54 => 3,
+        55..=81 => 16,
+        82..=93 => 64,
+        _ => 128,
+    }
 }
 fn format_timestamp(seconds: i64) -> String {
     format!(
@@ -317,6 +413,7 @@ fn format_timestamp(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     #[test]
     fn same_seed_and_range_produce_identical_copy_bytes() {
         let a = DeterministicGenerator::new(20260901)
@@ -455,5 +552,63 @@ mod tests {
             assert_eq!(tenant_id, 1);
             assert!((1..=20).contains(&order_id));
         }
+    }
+    #[test]
+    fn categorical_dictionaries_are_deterministically_skewed() {
+        let g = DeterministicGenerator::new(20260901);
+        let mut plans = BTreeMap::new();
+        let mut statuses = BTreeMap::new();
+        for id in 1..=10_000 {
+            let Row::Tenants { plan, .. } = g.row(Table::Tenants, id) else {
+                unreachable!()
+            };
+            *plans.entry(plan).or_insert(0_u64) += 1;
+            let Row::Orders { status, .. } = g.row(Table::Orders, id) else {
+                unreachable!()
+            };
+            *statuses.entry(status).or_insert(0_u64) += 1;
+        }
+        assert!(plans["free"] > plans["pro"] && plans["pro"] > plans["enterprise"]);
+        assert!(
+            statuses["paid"] > statuses["shipped"] && statuses["shipped"] > statuses["refunded"]
+        );
+    }
+    #[test]
+    fn json_is_btree_ordered_structured_and_size_bounded() {
+        let value = json(123, "order");
+        assert_eq!(
+            value,
+            r#"{"kind":"order","payload":123,"schema_version":1,"tags":{"bucket":3,"label":"xxx"}}"#
+        );
+        let g = DeterministicGenerator::new(20260901);
+        let mut sizes = BTreeMap::new();
+        for id in 1..=128 {
+            let Row::OrderEvents { metadata, .. } = g.row(Table::OrderEvents, id) else {
+                unreachable!()
+            };
+            assert!(metadata.len() <= 256);
+            *sizes.entry(metadata.len()).or_insert(0_u64) += 1;
+        }
+        assert!(
+            sizes.len() >= 3,
+            "JSON size distribution collapsed: {sizes:?}"
+        );
+    }
+    #[test]
+    fn tenant_activity_rank_uses_a_bounded_zipf_shape() {
+        let g = DeterministicGenerator::new(20260901);
+        let mut ranks = BTreeMap::new();
+        for id in 1..=10_000 {
+            let Row::Tenants { settings, .. } = g.row(Table::Tenants, id) else {
+                unreachable!()
+            };
+            let rank = serde_json::from_str::<Value>(&settings).unwrap()["activity_rank"]
+                .as_u64()
+                .unwrap();
+            assert!((1..=64).contains(&rank));
+            *ranks.entry(rank).or_insert(0_u64) += 1;
+        }
+        assert!(ranks[&1] > ranks[&2]);
+        assert!(ranks.len() > 8);
     }
 }
