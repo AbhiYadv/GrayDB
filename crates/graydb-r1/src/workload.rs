@@ -572,6 +572,11 @@ impl RateLimiter {
         if rows == 0 {
             return Ok(());
         }
+        if self.rate <= 0.0 {
+            return Err(anyhow!(
+                "rate limiter requires a positive rows-per-second rate"
+            ));
+        }
         if rows as f64 > self.capacity {
             return Err(anyhow!(
                 "rows {rows} exceed limiter burst {}",
@@ -758,5 +763,16 @@ mod tests {
                 achieved_rows: 20
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_rejects_unserviceable_requests_without_mutating_metrics() {
+        let mut zero_rate = RateLimiter::new(0, 10);
+        assert!(zero_rate.acquire(1).await.is_err());
+        assert!(zero_rate.intervals().is_empty());
+
+        let mut oversized = RateLimiter::new(10, 10);
+        assert!(oversized.acquire(11).await.is_err());
+        assert!(oversized.intervals().is_empty());
     }
 }
