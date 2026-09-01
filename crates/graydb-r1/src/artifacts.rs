@@ -216,16 +216,11 @@ pub fn sha256_tree(root: impl AsRef<Path>) -> Result<PathBuf> {
     );
 
     for (relative, absolute) in files {
-        let bytes = fs::read(&absolute)
-            .with_context(|| format!("reading {}", absolute.display()))?;
+        let bytes =
+            fs::read(&absolute).with_context(|| format!("reading {}", absolute.display()))?;
         let digest = Sha256::digest(&bytes);
-        writeln!(
-            output,
-            "{:x}  {}",
-            digest,
-            relative.to_string_lossy()
-        )
-        .with_context(|| format!("writing checksum for {}", relative.display()))?;
+        writeln!(output, "{:x}  {}", digest, relative.to_string_lossy())
+            .with_context(|| format!("writing checksum for {}", relative.display()))?;
     }
     output.flush().context("flushing SHA256SUMS")?;
     Ok(sums_path)
@@ -320,8 +315,8 @@ mod tests {
 
     #[test]
     fn redacts_credentials_from_both_log_formats() {
-        let event = Event::info("connect", "postgres://postgres:hunter2@pg/appdb")
-            .with_secret("hunter2");
+        let event =
+            Event::info("connect", "postgres://postgres:hunter2@pg/appdb").with_secret("hunter2");
         let rendered = event.render_redacted();
         assert!(!rendered.human.contains("hunter2"));
         assert!(!rendered.json.contains("hunter2"));

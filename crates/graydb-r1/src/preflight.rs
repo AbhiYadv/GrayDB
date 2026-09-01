@@ -105,7 +105,8 @@ impl PreflightPolicy {
         if !snapshot.data_path_on_expected_volume {
             failures.push(PreflightFailure {
                 code: "DATA_PATH_OUTSIDE_APPROVED_VOLUME".to_string(),
-                message: "data path did not resolve inside the approved external volume".to_string(),
+                message: "data path did not resolve inside the approved external volume"
+                    .to_string(),
             });
         }
 
@@ -171,7 +172,10 @@ impl Default for SystemPreflightProbe {
 }
 
 impl SystemPreflightProbe {
-    pub fn new(approved_data_root_prefix: impl Into<PathBuf>, colima_profile: impl Into<String>) -> Self {
+    pub fn new(
+        approved_data_root_prefix: impl Into<PathBuf>,
+        colima_profile: impl Into<String>,
+    ) -> Self {
         Self {
             approved_data_root_prefix: approved_data_root_prefix.into(),
             colima_profile: colima_profile.into(),
@@ -190,26 +194,16 @@ impl SystemPreflightProbe {
             .collect()
     }
 
-    fn run_json_command(&self, mut command: Command) -> Result<Value> {
-        let output = command
-            .output()
-            .context("running preflight command")?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let parsed = serde_json::from_str(&stdout).unwrap_or_else(|_| json!(stdout));
-        Ok(json!({
-            "status": output.status.code(),
-            "success": output.status.success(),
-            "stdout": parsed,
-            "stderr": stderr,
-        }))
+    fn run_json_command(
+        &self,
+        command_name: &'static str,
+        mut command: Command,
+    ) -> Result<ProbeCommandRecord> {
+        let output = command.output().context("running preflight command")?;
+        Ok(command_capture(command_name, output))
     }
 
-    fn write_environment_record(
-        &self,
-        run_root: &Path,
-        record: &EnvironmentRecord,
-    ) -> Result<()> {
+    fn write_environment_record(&self, run_root: &Path, record: &SystemProbeRecord) -> Result<()> {
         let path = run_root.join("environment.json");
         let file = OpenOptions::new()
             .create(true)
@@ -249,14 +243,11 @@ impl SystemPreflightProbe {
 
 impl PreflightProbe for SystemPreflightProbe {
     fn probe(&self, run_root: &Path) -> Result<PreflightSnapshot> {
-        fs::create_dir_all(run_root)
-            .with_context(|| format!("creating {}", run_root.display()))?;
+        fs::create_dir_all(run_root).with_context(|| format!("creating {}", run_root.display()))?;
         let canonical_data_root = run_root
             .canonicalize()
             .with_context(|| format!("canonicalizing {}", run_root.display()))?;
-        if !canonical_data_root
-            .starts_with(&self.approved_data_root_prefix)
-        {
+        if !canonical_data_root.starts_with(&self.approved_data_root_prefix) {
             return Err(anyhow!(
                 "data root {} is outside approved prefix {}",
                 canonical_data_root.display(),
@@ -264,15 +255,19 @@ impl PreflightProbe for SystemPreflightProbe {
             ));
         }
 
-        let volume_bytes = fs2::total_space(&canonical_data_root)
-            .with_context(|| format!("reading total space for {}", canonical_data_root.display()))?;
+        let volume_bytes = fs2::total_space(&canonical_data_root).with_context(|| {
+            format!("reading total space for {}", canonical_data_root.display())
+        })?;
         let available_bytes = fs2::available_space(&canonical_data_root).with_context(|| {
-            format!("reading available space for {}", canonical_data_root.display())
+            format!(
+                "reading available space for {}",
+                canonical_data_root.display()
+            )
         })?;
         let lock_available = probe_run_lock(run_root)?;
         let write_probe = self.probe_write_sync(run_root)?;
 
-        let colima_status = self.run_json_command({
+        let colima_status = self.run_json_command("colima status --profile r1 --json", {
             let mut command = Command::new("colima");
             command
                 .arg("status")
@@ -281,32 +276,37 @@ impl PreflightProbe for SystemPreflightProbe {
                 .arg("--json");
             command
         })?;
-        let docker_info = self.run_json_command({
+        let docker_info = self.run_json_command("docker info --format '{{json .}}'", {
             let mut command = Command::new("docker");
             command.arg("info").arg("--format").arg("{{json .}}");
             command
         })?;
 
-        let environment = EnvironmentRecord {
-            canonical_data_root: canonical_data_root.display().to_string(),
+        let probe_result = SystemProbeRecord::from_outputs(
+            canonical_data_root.display().to_string(),
             volume_bytes,
             available_bytes,
             write_probe,
             colima_status,
             docker_info,
-            environment: self.sanitize_env(),
-        };
-        self.write_environment_record(run_root, &environment)?;
+            self.sanitize_env(),
+        );
+
+        self.write_environment_record(run_root, &probe_result)?;
+
+        if let Some(error) = probe_result.command_error() {
+            return Err(anyhow!(error));
+        }
 
         Ok(PreflightSnapshot {
             volume_bytes,
             available_bytes,
             expected_peak_bytes: 0,
             runtime_stop_bytes: 0,
-            cpus: REQUIRED_CPUS,
-            memory_bytes: REQUIRED_MEMORY_BYTES,
-            data_path_on_expected_volume: canonical_data_root.starts_with(&self.approved_data_root_prefix),
-            colima_disk_bytes: REQUIRED_COLIMA_DISK_BYTES,
+            cpus: probe_result.resources.cpus,
+            memory_bytes: probe_result.resources.memory_bytes,
+            data_path_on_expected_volume: probe_result.data_path_on_expected_volume,
+            colima_disk_bytes: probe_result.resources.colima_disk_bytes,
             lock_available,
         })
     }
@@ -330,13 +330,15 @@ fn probe_run_lock(run_root: &Path) -> Result<bool> {
 }
 
 #[derive(Debug, Serialize)]
-struct EnvironmentRecord {
+struct SystemProbeRecord {
     canonical_data_root: String,
     volume_bytes: u64,
     available_bytes: u64,
     write_probe: WriteProbeRecord,
-    colima_status: Value,
-    docker_info: Value,
+    colima_status: ProbeCommandRecord,
+    docker_info: ProbeCommandRecord,
+    resources: ResourceSnapshotRecord,
+    data_path_on_expected_volume: bool,
     environment: BTreeMap<String, String>,
 }
 
@@ -347,9 +349,214 @@ struct WriteProbeRecord {
     elapsed_ms: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct ProbeCommandRecord {
+    command: String,
+    status: Option<i32>,
+    success: bool,
+    stdout: Value,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct ResourceSnapshotRecord {
+    cpus: u32,
+    memory_bytes: u64,
+    colima_disk_bytes: u64,
+}
+
+impl SystemProbeRecord {
+    fn from_outputs(
+        canonical_data_root: String,
+        volume_bytes: u64,
+        available_bytes: u64,
+        write_probe: WriteProbeRecord,
+        colima_status: ProbeCommandRecord,
+        docker_info: ProbeCommandRecord,
+        environment: BTreeMap<String, String>,
+    ) -> Self {
+        let resources = extract_resources(&colima_status.stdout, &docker_info.stdout);
+        let data_path_on_expected_volume =
+            canonical_data_root.starts_with(APPROVED_DATA_ROOT_PREFIX);
+        Self {
+            canonical_data_root,
+            volume_bytes,
+            available_bytes,
+            write_probe,
+            colima_status,
+            docker_info,
+            resources,
+            data_path_on_expected_volume,
+            environment,
+        }
+    }
+
+    fn command_error(&self) -> Option<String> {
+        if !self.colima_status.success {
+            return Some(format!(
+                "colima status --profile r1 --json failed with status {:?}",
+                self.colima_status.status
+            ));
+        }
+        if !self.docker_info.success {
+            return Some(format!(
+                "docker info --format '{{json .}}' failed with status {:?}",
+                self.docker_info.status
+            ));
+        }
+        None
+    }
+}
+
+fn command_capture(command: &'static str, output: std::process::Output) -> ProbeCommandRecord {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let parsed = serde_json::from_str(&stdout).unwrap_or_else(|_| json!(stdout));
+    ProbeCommandRecord {
+        command: command.to_string(),
+        status: output.status.code(),
+        success: output.status.success(),
+        stdout: parsed,
+        stderr,
+    }
+}
+
+fn extract_resources(colima_stdout: &Value, docker_stdout: &Value) -> ResourceSnapshotRecord {
+    let cpus = extract_cpu_count(colima_stdout)
+        .or_else(|| extract_cpu_count(docker_stdout))
+        .unwrap_or(0);
+    let memory_bytes = extract_bytes(colima_stdout, &["memory", "memory_bytes", "memorylimit"])
+        .or_else(|| extract_bytes(docker_stdout, &["memtotal", "memory", "memory_bytes"]))
+        .unwrap_or(0);
+    let colima_disk_bytes = extract_bytes(
+        colima_stdout,
+        &["disk", "disk_bytes", "disksize", "disk_size"],
+    )
+    .unwrap_or(0);
+    ResourceSnapshotRecord {
+        cpus,
+        memory_bytes,
+        colima_disk_bytes,
+    }
+}
+
+fn extract_cpu_count(value: &Value) -> Option<u32> {
+    find_numeric_value(value, &["cpus", "cpu", "cpu_count", "ncpu"]).and_then(|n| {
+        if n <= u32::MAX as u64 {
+            Some(n as u32)
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_bytes(value: &Value, keys: &[&str]) -> Option<u64> {
+    find_value_by_keys(value, keys).and_then(parse_bytes_value)
+}
+
+fn find_value_by_keys<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map {
+                if keys
+                    .iter()
+                    .any(|candidate| key.eq_ignore_ascii_case(candidate))
+                {
+                    return Some(nested);
+                }
+            }
+            for nested in map.values() {
+                if let Some(found) = find_value_by_keys(nested, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(|item| find_value_by_keys(item, keys)),
+        _ => None,
+    }
+}
+
+fn find_numeric_value(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse().ok(),
+        Value::Object(map) => {
+            for (key, nested) in map {
+                if keys
+                    .iter()
+                    .any(|candidate| key.eq_ignore_ascii_case(candidate))
+                {
+                    if let Some(found) = find_numeric_value(nested, keys) {
+                        return Some(found);
+                    }
+                    if let Some(found) = parse_numeric_text(nested) {
+                        return Some(found);
+                    }
+                }
+            }
+            for nested in map.values() {
+                if let Some(found) = find_numeric_value(nested, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(|item| find_numeric_value(item, keys)),
+        _ => None,
+    }
+}
+
+fn parse_numeric_text(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_bytes_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => parse_bytes_text(text),
+        _ => None,
+    }
+}
+
+fn parse_bytes_text(text: &str) -> Option<u64> {
+    let trimmed = text.trim().replace(',', "");
+    let lower = trimmed.to_ascii_lowercase();
+    let (number, factor) = if let Some(prefix) = lower.strip_suffix("gib") {
+        (prefix.trim(), 1_u64 << 30)
+    } else if let Some(prefix) = lower.strip_suffix("gb") {
+        (prefix.trim(), 1_000_000_000)
+    } else if let Some(prefix) = lower.strip_suffix("mib") {
+        (prefix.trim(), 1_u64 << 20)
+    } else if let Some(prefix) = lower.strip_suffix("mb") {
+        (prefix.trim(), 1_000_000)
+    } else if let Some(prefix) = lower.strip_suffix("kib") {
+        (prefix.trim(), 1_u64 << 10)
+    } else if let Some(prefix) = lower.strip_suffix("kb") {
+        (prefix.trim(), 1_000)
+    } else if let Some(prefix) = lower.strip_suffix('b') {
+        (prefix.trim(), 1)
+    } else {
+        (lower.trim(), 1)
+    };
+
+    if let Ok(value) = number.parse::<f64>() {
+        return Some((value * factor as f64).round() as u64);
+    }
+    number
+        .parse::<u64>()
+        .ok()
+        .map(|value| value.saturating_mul(factor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn rejects_projected_space_below_twenty_percent() {
@@ -385,5 +592,98 @@ mod tests {
         let report = PreflightPolicy::r1_mac().evaluate(&snapshot);
         assert!(report.passed);
         assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn extracts_runtime_resources_from_probe_outputs() {
+        let record = SystemProbeRecord::from_outputs(
+            "/Volumes/Crucial X9/GrayDB/.r1/run".to_string(),
+            1_000_000,
+            500_000,
+            WriteProbeRecord {
+                path: "/Volumes/Crucial X9/GrayDB/.r1/run/.preflight-write-probe.bin".to_string(),
+                bytes_written: 64_u64 << 20,
+                elapsed_ms: 42,
+            },
+            ProbeCommandRecord {
+                command: "colima status --profile r1 --json".to_string(),
+                status: Some(0),
+                success: true,
+                stdout: serde_json::json!({
+                    "cpus": 6,
+                    "memory": "10GiB",
+                    "disk": "500GiB"
+                }),
+                stderr: String::new(),
+            },
+            ProbeCommandRecord {
+                command: "docker info --format '{{json .}}'".to_string(),
+                status: Some(0),
+                success: true,
+                stdout: serde_json::json!({
+                    "NCPU": 6,
+                    "MemTotal": 10_737_418_240_u64
+                }),
+                stderr: String::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(record.resources.cpus, 6);
+        assert_eq!(record.resources.memory_bytes, 10_u64 << 30);
+        assert_eq!(record.resources.colima_disk_bytes, 500_u64 << 30);
+        assert!(record.command_error().is_none());
+    }
+
+    #[test]
+    fn records_failed_probe_commands_as_errors() {
+        let record = SystemProbeRecord::from_outputs(
+            "/Volumes/Crucial X9/GrayDB/.r1/run".to_string(),
+            1_000_000,
+            500_000,
+            WriteProbeRecord {
+                path: "/Volumes/Crucial X9/GrayDB/.r1/run/.preflight-write-probe.bin".to_string(),
+                bytes_written: 64_u64 << 20,
+                elapsed_ms: 42,
+            },
+            ProbeCommandRecord {
+                command: "colima status --profile r1 --json".to_string(),
+                status: Some(1),
+                success: false,
+                stdout: serde_json::json!({}),
+                stderr: "not running".to_string(),
+            },
+            ProbeCommandRecord {
+                command: "docker info --format '{{json .}}'".to_string(),
+                status: Some(0),
+                success: true,
+                stdout: serde_json::json!({}),
+                stderr: String::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(record.resources.cpus, 0);
+        assert_eq!(record.resources.memory_bytes, 0);
+        assert_eq!(record.resources.colima_disk_bytes, 0);
+        assert!(record.command_error().is_some());
+
+        let report = PreflightPolicy::r1_mac().evaluate(&PreflightSnapshot {
+            volume_bytes: 1_000_000,
+            available_bytes: 500_000,
+            expected_peak_bytes: 100_000,
+            runtime_stop_bytes: 50_000,
+            cpus: record.resources.cpus,
+            memory_bytes: record.resources.memory_bytes,
+            data_path_on_expected_volume: record.data_path_on_expected_volume,
+            colima_disk_bytes: record.resources.colima_disk_bytes,
+            lock_available: true,
+        });
+
+        assert!(!report.passed);
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.code == "CPU_LIMIT_TOO_SMALL"));
     }
 }
