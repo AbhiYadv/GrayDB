@@ -1,0 +1,61 @@
+benchmark_id = "R1-P1-v1"
+seed = 20260901
+freshness_p99_limit_ms = 1000
+backlog_limit_bytes = 10737418240
+minimum_query_samples = 30
+fixed_rates = [300, 1000]
+search_rates = [2000, 4000, 8000, 16000, 32000, 64000]
+
+[profiles.mac-smoke]
+minimum_bytes = 1073741824
+repetitions = 1
+warmup_secs = 60
+quiet_secs = 120
+fixed_rate_secs = 120
+search_step_secs = 120
+maximum_rate = 2000
+
+[profiles.mac-correctness]
+minimum_bytes = 10737418240
+repetitions = 1
+warmup_secs = 120
+quiet_secs = 300
+fixed_rate_secs = 300
+search_step_secs = 180
+maximum_rate = 4000
+
+[profiles.mac-validation]
+minimum_bytes = 53687091200
+repetitions = 3
+warmup_secs = 300
+quiet_secs = 600
+fixed_rate_secs = 600
+search_step_secs = 300
+maximum_rate = 8000
+
+[profiles.mac-stress]
+minimum_bytes = 107374182400
+repetitions = 3
+warmup_secs = 600
+quiet_secs = 900
+fixed_rate_secs = 1200
+search_step_secs = 600
+maximum_rate = 16000
+
+[profiles.mac-ceiling]
+minimum_bytes = 214748364800
+repetitions = 3
+warmup_secs = 600
+quiet_secs = 900
+fixed_rate_secs = 1200
+search_step_secs = 600
+maximum_rate = 16000
+
+[profiles.aws-phase1]
+minimum_bytes = 1099511627776
+repetitions = 3
+warmup_secs = 900
+quiet_secs = 1800
+fixed_rate_secs = 1800
+search_step_secs = 900
+maximum_rate = 64000
