@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
-use tokio_postgres::Client;
+use tokio_postgres::{Client, NoTls};
 
 pub const CONTROL_SLOT: &str = "graydb_r1_control_slot";
 pub const CONTROL_PUBLICATION: &str = "graydb_r1_control_pub";
@@ -32,6 +33,60 @@ pub struct LedgerCommit {
     /// workload checkpoints and slot acknowledgement.
     pub source_lsn: u64,
     pub operation_sha256: String,
+}
+
+/// Classification of an outcome that may have lost its write connection. This
+/// boundary is deliberately independent from `ApplicationWriter`'s write client:
+/// a client which failed during COMMIT cannot be trusted to answer the marker
+/// query that decides whether a retry is safe.
+#[async_trait::async_trait]
+pub trait CommitRecovery: Send + Sync {
+    async fn classify_committed_plan(&self, plan: &TransactionPlan) -> Result<CommitState>;
+}
+
+/// Opens a separate PostgreSQL connection for each uncertain-commit
+/// classification. The short-lived client is closed after the marker query so it
+/// cannot accidentally become the application's write connection.
+#[derive(Debug, Clone)]
+pub struct PostgresCommitRecovery {
+    database_url: String,
+}
+
+impl PostgresCommitRecovery {
+    pub fn new(database_url: impl Into<String>) -> Self {
+        Self {
+            database_url: database_url.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommitRecovery for PostgresCommitRecovery {
+    async fn classify_committed_plan(&self, plan: &TransactionPlan) -> Result<CommitState> {
+        let (client, connection) = tokio_postgres::connect(&self.database_url, NoTls)
+            .await
+            .context("opening fresh recovery connection")?;
+        let driver = tokio::spawn(async move { connection.await });
+        let row = client
+            .query_opt(
+                "SELECT operation_sha256 FROM r1_control.tx_marker WHERE sequence = $1",
+                &[&(plan.sequence as i64)],
+            )
+            .await
+            .context("querying control marker from fresh recovery connection")?;
+        drop(client);
+        driver
+            .await
+            .context("joining fresh recovery connection")?
+            .context("fresh recovery connection failed")?;
+        match row {
+            Some(row) if row.get::<_, String>(0) == plan.operation_sha256 => {
+                Ok(CommitState::Committed)
+            }
+            Some(_) => bail!("control marker hash disagrees with transaction intent"),
+            None => Ok(CommitState::UnknownCommit),
+        }
+    }
 }
 
 /// Incrementally maps a marker row to the commit-end LSN that made its transaction
@@ -127,24 +182,64 @@ pub struct ControlReplicationConfig {
 pub async fn run_control_replication(
     config: ControlReplicationConfig,
     mapped_tx: mpsc::Sender<LedgerCommit>,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut repl = ReplClient::connect(
+    run_control_replication_with_ready(config, mapped_tx, stop, None).await
+}
+
+/// Variant used by service integration tests and controllers which need an explicit
+/// guarantee that the control slot is streaming before the first application
+/// transaction is submitted.
+pub async fn run_control_replication_with_ready(
+    config: ControlReplicationConfig,
+    mapped_tx: mpsc::Sender<LedgerCommit>,
+    mut stop: watch::Receiver<bool>,
+    ready: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+) -> Result<()> {
+    let mut ready = ready;
+    let mut repl = match ReplClient::connect(
         &config.host,
         config.port,
         &config.user,
         &config.password,
         &config.database,
     )
-    .await?;
-    let snapshot = repl.create_slot_with_snapshot(CONTROL_SLOT).await?;
+    .await
+    {
+        Ok(repl) => repl,
+        Err(error) => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.to_string()));
+            }
+            return Err(error);
+        }
+    };
+    let snapshot = match repl.create_slot_with_snapshot(CONTROL_SLOT).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error.to_string()));
+            }
+            return Err(error);
+        }
+    };
     let start_lsn = if config.initial_lsn == 0 {
         parse_lsn(&snapshot.consistent_point)?
     } else {
         config.initial_lsn
     };
-    repl.start_replication(CONTROL_SLOT, CONTROL_PUBLICATION, start_lsn)
-        .await?;
+    if let Err(error) = repl
+        .start_replication(CONTROL_SLOT, CONTROL_PUBLICATION, start_lsn)
+        .await
+    {
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Err(error.to_string()));
+        }
+        return Err(error);
+    }
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
 
     let mut log = FrameLog::create(&config.frame_log_dir, config.segment_max_bytes).await?;
     let mut mapper = ControlLsnMapper::new();
@@ -201,6 +296,7 @@ fn pgoutput_commit_end_lsn(payload: &[u8]) -> Option<u64> {
 /// SQL commit time; it waits for the independently durable control publication.
 pub struct ApplicationWriter {
     client: Client,
+    recovery: Arc<dyn CommitRecovery>,
     planner: WorkloadPlanner,
     intents: IntentLog,
     ledger: CommittedLedger,
@@ -211,6 +307,7 @@ pub struct ApplicationWriter {
 impl ApplicationWriter {
     pub fn new(
         client: Client,
+        recovery: Arc<dyn CommitRecovery>,
         planner: WorkloadPlanner,
         intents: IntentLog,
         ledger: CommittedLedger,
@@ -218,6 +315,7 @@ impl ApplicationWriter {
     ) -> Self {
         Self {
             client,
+            recovery,
             planner,
             intents,
             ledger,
@@ -228,6 +326,13 @@ impl ApplicationWriter {
 
     pub fn ledger(&self) -> &CommittedLedger {
         &self.ledger
+    }
+
+    /// Models a process death after SQL COMMIT: ownership of the write client is
+    /// discarded while the independently-owned control-stream receiver survives
+    /// and is handed to a newly constructed writer.
+    pub fn into_mapped_receiver(self) -> mpsc::Receiver<LedgerCommit> {
+        self.mapped_rx
     }
 
     /// Runs generated plans until `stop` is set. `target_rate` is affected rows per
@@ -251,26 +356,17 @@ impl ApplicationWriter {
             CommitState::Committed => bail!("plan {} is already committed", plan.sequence),
             CommitState::UnknownCommit => {}
         }
-        self.intents.append(plan)?;
-        let xid = match execute_transaction(&mut self.client, plan).await {
+        let xid = match self.submit_plan(plan).await {
             Ok(xid) => Some(xid),
             Err(error) => {
                 // A disconnect after COMMIT submission is intentionally never retried
                 // here. The marker classifies the intent before either accepting it
                 // or returning an UnknownCommit to the controller.
-                match self.classify_unknown_commit(plan).await {
-                    Ok(CommitState::Committed) => None,
-                    Ok(CommitState::UnknownCommit) => {
-                        return Err(error).context(
-                            "SQL transaction outcome unknown; no matching control marker before retry",
-                        );
-                    }
-                    Err(classification) => {
-                        return Err(error).context(format!(
-                            "SQL transaction outcome unknown and control-marker classification failed: {classification:#}"
-                        ));
-                    }
-                }
+                return self.recover_and_record(plan).await.with_context(|| {
+                    format!(
+                        "SQL transaction outcome unknown; fresh marker classification required before retry: {error:#}"
+                    )
+                });
             }
         };
         let mapped = self
@@ -284,6 +380,36 @@ impl ApplicationWriter {
         }
         self.append_ledger(&mapped)?;
         Ok(mapped)
+    }
+
+    /// Durably records intent and submits its SQL transaction, but deliberately
+    /// does not wait for the control stream or append the workload ledger. This is
+    /// the explicit crash boundary used by the recovery integration test.
+    pub async fn submit_plan(&mut self, plan: &TransactionPlan) -> Result<u32> {
+        match self.ledger.classify(plan) {
+            CommitState::Committed => bail!("plan {} is already committed", plan.sequence),
+            CommitState::UnknownCommit => {}
+        }
+        self.intents.append(plan)?;
+        execute_transaction(&mut self.client, plan).await
+    }
+
+    /// Resolves a plan left between SQL COMMIT and ledger append. It always asks a
+    /// fresh recovery provider first, and accepts the plan only after the same
+    /// sequence/hash is observed through the durable control mapper.
+    pub async fn recover_and_record(&mut self, plan: &TransactionPlan) -> Result<LedgerCommit> {
+        match self.recovery.classify_committed_plan(plan).await? {
+            CommitState::Committed => {
+                let mapped = self
+                    .wait_for_mapping(plan.sequence, &plan.operation_sha256)
+                    .await?;
+                self.append_ledger(&mapped)?;
+                Ok(mapped)
+            }
+            CommitState::UnknownCommit => bail!(
+                "SQL transaction outcome remains unknown; no retry is permitted before a fresh control marker appears"
+            ),
+        }
     }
 
     pub async fn wait_for_mapping(&mut self, sequence: u64, hash: &str) -> Result<LedgerCommit> {
@@ -335,23 +461,6 @@ impl ApplicationWriter {
             committed_unix_ms: unix_ms(),
             previous_entry_sha256,
             entry_sha256: String::new(),
-        })
-    }
-
-    /// Ask the control table whether a post-COMMIT transport failure committed this
-    /// exact intent. Callers must await the mapper if this returns `Some`.
-    pub async fn classify_unknown_commit(&self, plan: &TransactionPlan) -> Result<CommitState> {
-        let row = self
-            .client
-            .query_opt(
-                "SELECT operation_sha256 FROM r1_control.tx_marker WHERE sequence = $1",
-                &[&(plan.sequence as i64)],
-            )
-            .await?;
-        Ok(match row {
-            Some(row) if row.get::<_, String>(0) == plan.operation_sha256 => CommitState::Committed,
-            Some(_) => bail!("control marker hash disagrees with transaction intent"),
-            None => CommitState::UnknownCommit,
         })
     }
 }
