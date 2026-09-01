@@ -1,5 +1,8 @@
 benchmark_id = "R1-P1-v1"
 seed = 20260901
+insert_rows_pct = 90
+update_rows_pct = 8
+delete_rows_pct = 2
 freshness_p99_limit_ms = 1000
 backlog_limit_bytes = 10737418240
 minimum_query_samples = 30

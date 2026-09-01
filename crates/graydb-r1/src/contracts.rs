@@ -52,6 +52,9 @@ pub struct ProfileSpec {
 pub struct ProfileCatalog {
     pub benchmark_id: String,
     pub seed: u64,
+    pub insert_rows_pct: u8,
+    pub update_rows_pct: u8,
+    pub delete_rows_pct: u8,
     pub freshness_p99_limit_ms: u64,
     pub backlog_limit_bytes: u64,
     pub minimum_query_samples: u64,
@@ -100,22 +103,102 @@ mod tests {
     #[test]
     fn profile_catalog_matches_r1_p1_v1() {
         let catalog = ProfileCatalog::load(repo_file("bench/r1/profiles.toml")).unwrap();
-        let smoke = catalog.get(ScaleProfile::MacSmoke).unwrap();
-        assert_eq!(smoke.minimum_bytes, 1_u64 << 30);
-        assert_eq!(smoke.repetitions, 1);
-        assert_eq!(smoke.warmup_secs, 60);
-        assert_eq!(smoke.quiet_secs, 120);
-        assert_eq!(smoke.fixed_rate_secs, 120);
-        assert_eq!(smoke.search_step_secs, 120);
-        assert_eq!(smoke.maximum_rate, 2_000);
+        assert_eq!(catalog.benchmark_id, "R1-P1-v1");
+        assert_eq!(catalog.seed, 20260901);
+        assert_eq!(catalog.insert_rows_pct, 90);
+        assert_eq!(catalog.update_rows_pct, 8);
+        assert_eq!(catalog.delete_rows_pct, 2);
+        assert_eq!(catalog.freshness_p99_limit_ms, 1_000);
+        assert_eq!(catalog.backlog_limit_bytes, 10_737_418_240);
+        assert_eq!(catalog.minimum_query_samples, 30);
+        assert_eq!(catalog.fixed_rates, vec![300, 1000]);
+        assert_eq!(
+            catalog.search_rates,
+            vec![2000, 4000, 8000, 16000, 32000, 64000]
+        );
 
-        let aws = catalog.get(ScaleProfile::AwsPhase1).unwrap();
-        assert_eq!(aws.minimum_bytes, 1_u64 << 40);
-        assert_eq!(aws.repetitions, 3);
-        assert_eq!(aws.warmup_secs, 900);
-        assert_eq!(aws.quiet_secs, 1_800);
-        assert_eq!(aws.fixed_rate_secs, 1_800);
-        assert_eq!(aws.search_step_secs, 900);
-        assert_eq!(aws.maximum_rate, 64_000);
+        let expect = [
+            (
+                ScaleProfile::MacSmoke,
+                1_u64 << 30,
+                1,
+                60,
+                120,
+                120,
+                120,
+                2_000,
+            ),
+            (
+                ScaleProfile::MacCorrectness,
+                10_u64 << 30,
+                1,
+                120,
+                300,
+                300,
+                180,
+                4_000,
+            ),
+            (
+                ScaleProfile::MacValidation,
+                50_u64 << 30,
+                3,
+                300,
+                600,
+                600,
+                300,
+                8_000,
+            ),
+            (
+                ScaleProfile::MacStress,
+                100_u64 << 30,
+                3,
+                600,
+                900,
+                1200,
+                600,
+                16_000,
+            ),
+            (
+                ScaleProfile::MacCeiling,
+                200_u64 << 30,
+                3,
+                600,
+                900,
+                1200,
+                600,
+                16_000,
+            ),
+            (
+                ScaleProfile::AwsPhase1,
+                1_u64 << 40,
+                3,
+                900,
+                1_800,
+                1_800,
+                900,
+                64_000,
+            ),
+        ];
+
+        for (
+            profile,
+            minimum_bytes,
+            repetitions,
+            warmup_secs,
+            quiet_secs,
+            fixed_rate_secs,
+            search_step_secs,
+            maximum_rate,
+        ) in expect
+        {
+            let spec = catalog.get(profile).unwrap();
+            assert_eq!(spec.minimum_bytes, minimum_bytes, "{profile:?}");
+            assert_eq!(spec.repetitions, repetitions, "{profile:?}");
+            assert_eq!(spec.warmup_secs, warmup_secs, "{profile:?}");
+            assert_eq!(spec.quiet_secs, quiet_secs, "{profile:?}");
+            assert_eq!(spec.fixed_rate_secs, fixed_rate_secs, "{profile:?}");
+            assert_eq!(spec.search_step_secs, search_step_secs, "{profile:?}");
+            assert_eq!(spec.maximum_rate, maximum_rate, "{profile:?}");
+        }
     }
 }
