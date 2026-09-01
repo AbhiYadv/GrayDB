@@ -31,8 +31,14 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(7432);
+    let bind_addr: std::net::IpAddr = std::env::var("GRAYDB_STUDIO_BIND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
     let engine = Engine::new(cfg);
-    engine.event("info", "GrayDB Studio started — attach to begin").await;
+    engine
+        .event("info", "GrayDB Studio started — attach to begin")
+        .await;
 
     let app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
@@ -47,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chaos/restart-source", post(restart_source))
         .with_state(engine);
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = std::net::SocketAddr::from((bind_addr, port));
     println!("GrayDB Studio listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -141,5 +147,31 @@ async fn restart_source(State(e): Eng) -> impl IntoResponse {
     match e.chaos_restart_source().await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(x) => err(x).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+
+    #[test]
+    fn default_bind_is_loopback() {
+        std::env::remove_var("GRAYDB_STUDIO_BIND");
+        let bind_addr: IpAddr = std::env::var("GRAYDB_STUDIO_BIND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+        assert_eq!(bind_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn explicit_bind_is_respected() {
+        std::env::set_var("GRAYDB_STUDIO_BIND", "0.0.0.0");
+        let bind_addr: IpAddr = std::env::var("GRAYDB_STUDIO_BIND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+        assert_eq!(bind_addr, "0.0.0.0".parse::<IpAddr>().unwrap());
+        std::env::remove_var("GRAYDB_STUDIO_BIND");
     }
 }
