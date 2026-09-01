@@ -1,6 +1,7 @@
 # Build output (23 GB — never commit)
 target/
 dist/
+.worktrees/
 
 # Derived data: every byte is rebuildable from snapshot + log replay (invariant I3)
 data/
