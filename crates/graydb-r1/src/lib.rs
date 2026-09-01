@@ -1,15 +1,18 @@
 pub mod artifacts;
 pub mod contracts;
 pub mod generator;
+pub mod ledger;
 pub mod manifest;
 pub mod preflight;
 pub mod query;
+pub mod workload;
 
 pub use artifacts::{sha256_tree, Event, EventLevel, EventRender, EventSink, RunDirectory};
 pub use contracts::{
     EngineKind, LogicalCheckpoint, ProfileCatalog, ProfileSpec, RunConfig, RunMode, ScaleProfile,
 };
 pub use generator::{CopyBatch, DeterministicGenerator, Row, Table};
+pub use ledger::{CommitState, CommittedLedger, IntentLog, LedgerEntry};
 pub use manifest::{
     BatchManifest, CopySink, DatasetIdentity, DatasetLoader, DatasetManifest, DatasetProbeMetadata,
     PostgresCopySink, PostgresPublishedSizeProbe, PublishedSizeProbe, TableManifest,
@@ -20,3 +23,7 @@ pub use preflight::{
     SnapshotPreflightProbe, SystemPreflightProbe,
 };
 pub use query::{canonical_digest, QueryId, QueryParameters, QuerySchedule};
+pub use workload::{
+    CustomerRow, Operation, OrderEventRow, OrderRow, RateInterval, RateLimiter, RowMix,
+    TransactionPlan, WorkloadPlanner,
+};
