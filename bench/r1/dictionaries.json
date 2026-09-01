@@ -1,0 +1,1 @@
+{"regions":["us-east","us-west","eu-west","ap-south"],"plans":["free","pro","enterprise"],"segments":["consumer","smb","mid-market","enterprise"],"statuses":["pending","paid","shipped","cancelled","refunded"],"channels":["web","mobile","partner"],"event_types":["created","paid","fulfilled","cancelled","returned"]}

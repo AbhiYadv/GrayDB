@@ -1,0 +1,14 @@
+CREATE SCHEMA IF NOT EXISTS r1;
+CREATE SCHEMA IF NOT EXISTS r1_control;
+CREATE TABLE r1.tenants (tenant_id bigint PRIMARY KEY, region text NOT NULL, plan text NOT NULL, created_at timestamptz NOT NULL, settings jsonb NOT NULL);
+CREATE TABLE r1.customers (customer_id bigint PRIMARY KEY, tenant_id bigint NOT NULL, segment text NOT NULL, email_domain text NOT NULL, profile jsonb NOT NULL, created_at timestamptz NOT NULL);
+CREATE TABLE r1.orders (order_id bigint PRIMARY KEY, tenant_id bigint NOT NULL, customer_id bigint NOT NULL, status text NOT NULL, channel text NOT NULL, amount_cents bigint NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, attributes jsonb NOT NULL);
+CREATE TABLE r1.order_events (event_id bigint PRIMARY KEY, order_id bigint NOT NULL, tenant_id bigint NOT NULL, event_type text NOT NULL, event_at timestamptz NOT NULL, metadata jsonb NOT NULL);
+CREATE TABLE r1_control.tx_marker (sequence bigint PRIMARY KEY, operation_sha256 text NOT NULL, committed_at timestamptz NOT NULL DEFAULT clock_timestamp());
+ALTER TABLE r1.tenants REPLICA IDENTITY DEFAULT;
+ALTER TABLE r1.customers REPLICA IDENTITY DEFAULT;
+ALTER TABLE r1.orders REPLICA IDENTITY DEFAULT;
+ALTER TABLE r1.order_events REPLICA IDENTITY DEFAULT;
+ALTER TABLE r1_control.tx_marker REPLICA IDENTITY DEFAULT;
+CREATE PUBLICATION graydb_r1_pub FOR TABLE r1.tenants, r1.customers, r1.orders, r1.order_events;
+CREATE PUBLICATION graydb_r1_control_pub FOR TABLE r1_control.tx_marker;
