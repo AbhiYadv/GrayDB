@@ -31,10 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(7432);
-    let bind_addr: std::net::IpAddr = std::env::var("GRAYDB_STUDIO_BIND")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+    let bind_addr = parse_bind_addr(std::env::var("GRAYDB_STUDIO_BIND").ok().as_deref());
     let engine = Engine::new(cfg);
     engine
         .event("info", "GrayDB Studio started — attach to begin")
@@ -100,13 +97,39 @@ struct QueryReq {
 async fn query(State(e): Eng, Json(req): Json<QueryReq>) -> impl IntoResponse {
     match e.query(&req.sql, &req.class).await {
         Ok((rows, cols, proof)) => {
-            Json(json!({ "columns": cols, "rows": rows, "proof": proof })).into_response()
+            // Keep the rendered footer for humans, and expose a stable machine
+            // contract so clients never parse presentation text.
+            let status = match e.status().await {
+                Ok(status) => status,
+                Err(error) => return err(error).into_response(),
+            };
+            let target_lsn = req
+                .class
+                .strip_prefix("target_lsn=")
+                .and_then(|value| graydb_ingest::repl::parse_lsn(value.trim()).ok());
+            let visible_lsn = graydb_ingest::repl::parse_lsn(&status.applied_lsn).ok();
+            Json(json!({
+                "columns": cols,
+                "rows": rows,
+                "proof": proof,
+                "proof_data": {
+                    "target_lsn": target_lsn,
+                    "visible_lsn": visible_lsn,
+                },
+            }))
+            .into_response()
         }
         Err(x) => {
             e.event("error", format!("query failed: {x:#}")).await;
             err(x).into_response()
         }
     }
+}
+
+fn parse_bind_addr(value: Option<&str>) -> std::net::IpAddr {
+    value
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "127.0.0.1".parse().unwrap())
 }
 
 #[derive(Deserialize)]
@@ -152,26 +175,18 @@ async fn restart_source(State(e): Eng) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_bind_addr;
     use std::net::IpAddr;
 
     #[test]
     fn default_bind_is_loopback() {
-        std::env::remove_var("GRAYDB_STUDIO_BIND");
-        let bind_addr: IpAddr = std::env::var("GRAYDB_STUDIO_BIND")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+        let bind_addr: IpAddr = parse_bind_addr(None);
         assert_eq!(bind_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn explicit_bind_is_respected() {
-        std::env::set_var("GRAYDB_STUDIO_BIND", "0.0.0.0");
-        let bind_addr: IpAddr = std::env::var("GRAYDB_STUDIO_BIND")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+        let bind_addr: IpAddr = parse_bind_addr(Some("0.0.0.0"));
         assert_eq!(bind_addr, "0.0.0.0".parse::<IpAddr>().unwrap());
-        std::env::remove_var("GRAYDB_STUDIO_BIND");
     }
 }

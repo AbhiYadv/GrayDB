@@ -11,7 +11,15 @@ use tokio::sync::OnceCell;
 struct StudioQueryResponse {
     columns: Vec<String>,
     rows: Vec<Vec<Option<String>>>,
-    proof: String,
+    #[serde(rename = "proof")]
+    _human_proof: String,
+    proof_data: MachineLsnProof,
+}
+
+#[derive(Debug, Deserialize)]
+struct MachineLsnProof {
+    target_lsn: Option<u64>,
+    visible_lsn: Option<u64>,
 }
 
 pub struct GrayDbAdapter {
@@ -175,19 +183,26 @@ impl EngineAdapter for GrayDbAdapter {
 
         let body: StudioQueryResponse = resp.json().await.context("query response json failed")?;
 
-        let proof_lsn = parse_proof_lsn(&body.proof).context("parsing proof LSN")?;
+        let proof_target = body
+            .proof_data
+            .target_lsn
+            .context("query proof missing target LSN")?;
+        let visible_lsn = body
+            .proof_data
+            .visible_lsn
+            .context("query proof missing visible LSN")?;
         anyhow::ensure!(
-            proof_lsn == invocation.target_lsn,
+            proof_target == invocation.target_lsn && visible_lsn >= invocation.target_lsn,
             "LSN proof mismatch: expected {}, got {}",
             invocation.target_lsn,
-            proof_lsn
+            format!("target={proof_target}, visible={visible_lsn}")
         );
 
         Ok(QueryResult {
             columns: body.columns,
             rows: body.rows,
             target_lsn: invocation.target_lsn,
-            visible_lsn: proof_lsn,
+            visible_lsn,
             elapsed_ns: start.elapsed().as_nanos(),
             rows_read: None,
             bytes_read: None,
@@ -207,14 +222,6 @@ fn parse_lsn(s: &str) -> Result<u64> {
     let hi = u32::from_str_radix(parts[0], 16).context("parsing LSN hi")?;
     let lo = u32::from_str_radix(parts[1], 16).context("parsing LSN lo")?;
     Ok(((hi as u64) << 32) | (lo as u64))
-}
-
-fn parse_proof_lsn(proof: &str) -> Result<u64> {
-    let target = proof
-        .strip_prefix("LSN proof: target=")
-        .and_then(|rest| rest.split_whitespace().next())
-        .ok_or_else(|| anyhow!("invalid LSN proof: {proof}"))?;
-    parse_lsn(target)
 }
 
 #[cfg(test)]
@@ -254,7 +261,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "columns": ["status", "count"],
                 "rows": [["paid", "2"]],
-                "proof": "LSN proof: target=A/42 received=A/43"
+                "proof": "human wording may change",
+                "proof_data": {
+                    "target_lsn": 0xA000_0042_u64,
+                    "visible_lsn": 0xA000_0043_u64
+                }
             })))
             .mount(&server)
             .await;

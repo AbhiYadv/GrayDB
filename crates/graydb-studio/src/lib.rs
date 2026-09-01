@@ -21,6 +21,7 @@ use datafusion::scalar::ScalarValue;
 // (columnar reads now flow through provider.rs streaming scans)
 use graydb_ingest::repl::format_lsn;
 use graydb_search::SearchReader;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub struct TableShape {
     pub dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsnProof {
     pub target_lsn: Option<u64>,
     /// Last source WAL position received on the replication stream
