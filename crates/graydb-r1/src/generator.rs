@@ -117,7 +117,7 @@ impl DeterministicGenerator {
     pub fn row(&self, table: Table, id: u64) -> Row {
         let selected_customer =
             customer_for_order(self.seed, table, id, self.draw(table, id, 7), id);
-        let selected_order = 1 + self.draw(table, id, 3) % id.max(1);
+        let selected_order = order_for_event(id, self.draw(table, id, 3));
         let tenant = match table {
             Table::Tenants => id,
             Table::Customers => tenant_for_customer(id),
@@ -271,20 +271,20 @@ impl DeterministicGenerator {
     }
 }
 fn tenant_for_customer(id: u64) -> u64 {
-    1 + ((id.saturating_sub(1) / 10_000) % 10_000)
+    cycle_base(id) + 1
 }
 fn tenant_for_order(id: u64) -> u64 {
-    1 + (id.saturating_sub(1) % 10_000)
+    cycle_base(id) + 1
 }
 fn customer_for_order(seed: u64, table: Table, order_id: u64, draw: u64, limit: u64) -> u64 {
-    let tenant = tenant_for_order(order_id);
-    let offset = draw % limit.max(1).min(10_000);
-    let candidate = (tenant - 1) * 10_000 + offset + 1;
-    if candidate == 0 {
-        1 + crate::generator::mix64(seed ^ table.tag()) % limit.max(1)
-    } else {
-        candidate
-    }
+    let _ = (seed, table, limit);
+    cycle_base(order_id) + 1 + draw % 5
+}
+fn cycle_base(id: u64) -> u64 {
+    id.saturating_sub(1) / 100 * 100
+}
+fn order_for_event(id: u64, draw: u64) -> u64 {
+    cycle_base(id) + 1 + draw % 20
 }
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -387,6 +387,46 @@ mod tests {
                 .sum::<u64>(),
             86
         );
+        let g = DeterministicGenerator::new(20260901);
+        let ranges = cycle_ranges(1);
+        let ids = |table: Table| {
+            ranges
+                .iter()
+                .find(|r| r.table == table)
+                .unwrap()
+                .range
+                .clone()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let customers = ids(Table::Customers);
+        let orders = ids(Table::Orders);
+        let tenants = ids(Table::Tenants);
+        for id in 1..61 {
+            match g.row(Table::OrderEvents, id) {
+                Row::OrderEvents {
+                    order_id,
+                    tenant_id,
+                    ..
+                } => {
+                    assert!(orders.contains(&order_id));
+                    assert!(tenants.contains(&tenant_id));
+                }
+                _ => unreachable!(),
+            }
+        }
+        for id in 1..21 {
+            match g.row(Table::Orders, id) {
+                Row::Orders {
+                    customer_id,
+                    tenant_id,
+                    ..
+                } => {
+                    assert!(customers.contains(&customer_id));
+                    assert!(tenants.contains(&tenant_id));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
     #[test]
     fn first_cycle_orders_and_events_reference_loaded_prefix_rows() {
