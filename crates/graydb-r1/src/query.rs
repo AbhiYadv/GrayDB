@@ -76,6 +76,12 @@ pub struct QueryResult {
 }
 pub fn canonical_digest(result: &QueryResult) -> String {
     let mut encoded = Vec::new();
+    for column in &result.columns {
+        encoded.extend_from_slice(column.len().to_string().as_bytes());
+        encoded.push(b':');
+        encoded.extend_from_slice(column.as_bytes());
+        encoded.push(b';');
+    }
     let mut rows: Vec<Vec<u8>> = result
         .rows
         .iter()

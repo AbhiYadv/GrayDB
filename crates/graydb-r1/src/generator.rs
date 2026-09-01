@@ -3,6 +3,35 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ops::Range;
 
+pub const COPY_BATCH_ROWS: u64 = 100_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRange {
+    pub table: Table,
+    pub range: Range<u64>,
+}
+
+/// Stable initial-load cycle: each complete cycle has 1 tenant, 5 customers,
+/// 20 orders, and 60 events. Truncating the returned vector is prefix-stable.
+pub fn cycle_ranges(cycles: u64) -> Vec<TableRange> {
+    let mut out = Vec::with_capacity(cycles as usize * 4);
+    for cycle in 0..cycles {
+        let base = cycle * 100;
+        for (table, count) in [
+            (Table::Tenants, 1),
+            (Table::Customers, 5),
+            (Table::Orders, 20),
+            (Table::OrderEvents, 60),
+        ] {
+            out.push(TableRange {
+                table,
+                range: base + 1..base + count + 1,
+            });
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Table {
     Tenants,
@@ -75,9 +104,29 @@ impl DeterministicGenerator {
     pub fn new(seed: u64) -> Self {
         Self { seed }
     }
+    pub fn copy_batches(&self, table: Table, range: Range<u64>) -> Result<Vec<CopyBatch>> {
+        let mut out = Vec::new();
+        let mut start = range.start;
+        while start < range.end {
+            let end = (start + COPY_BATCH_ROWS).min(range.end);
+            out.push(self.copy_batch(table, start..end)?);
+            start = end;
+        }
+        Ok(out)
+    }
     pub fn row(&self, table: Table, id: u64) -> Row {
-        let tenant = 1 + self.draw(table, id, 1) % 10_000;
-        let created = 1_609_459_200_i64 + (self.draw(table, id, 2) % 31_536_000) as i64;
+        let selected_customer =
+            customer_for_order(self.seed, table, id, self.draw(table, id, 7), id);
+        let selected_order = 1 + self.draw(table, id, 3) % id.max(1);
+        let tenant = match table {
+            Table::Tenants => id,
+            Table::Customers => tenant_for_customer(id),
+            Table::Orders => tenant_for_customer(selected_customer),
+            Table::OrderEvents => tenant_for_order(selected_order),
+        };
+        // Squaring the bounded draw concentrates records toward the recent end.
+        let age = self.draw(table, id, 2) % 31_536_000;
+        let created = 1_609_459_200_i64 + 31_536_000_i64 - ((age * age) / 31_536_000) as i64;
         let ts = format_timestamp(created);
         match table {
             Table::Tenants => Row::Tenants {
@@ -106,13 +155,15 @@ impl DeterministicGenerator {
                 Row::Orders {
                     order_id: id,
                     tenant_id: tenant,
-                    customer_id: 1 + self.draw(table, id, 7) % 10_000_000,
+                    customer_id: selected_customer,
                     status: ["pending", "paid", "shipped", "cancelled", "refunded"]
                         [(self.draw(table, id, 3) % 5) as usize]
                         .into(),
                     channel: ["web", "mobile", "partner"][(self.draw(table, id, 4) % 3) as usize]
                         .into(),
-                    amount_cents: 100 + (self.draw(table, id, 5) % 999_900) as i64,
+                    amount_cents: 100
+                        + ((self.draw(table, id, 5) % 1_000) * (self.draw(table, id, 9) % 1_000))
+                            as i64,
                     created_at: ts,
                     updated_at: updated,
                     attributes: json(self.draw(table, id, 8), "order"),
@@ -120,7 +171,7 @@ impl DeterministicGenerator {
             }
             Table::OrderEvents => Row::OrderEvents {
                 event_id: id,
-                order_id: 1 + self.draw(table, id, 3) % 10_000_000,
+                order_id: selected_order,
                 tenant_id: tenant,
                 event_type: ["created", "paid", "fulfilled", "cancelled", "returned"]
                     [(self.draw(table, id, 4) % 5) as usize]
@@ -219,6 +270,22 @@ impl DeterministicGenerator {
         }
     }
 }
+fn tenant_for_customer(id: u64) -> u64 {
+    1 + ((id.saturating_sub(1) / 10_000) % 10_000)
+}
+fn tenant_for_order(id: u64) -> u64 {
+    1 + (id.saturating_sub(1) % 10_000)
+}
+fn customer_for_order(seed: u64, table: Table, order_id: u64, draw: u64, limit: u64) -> u64 {
+    let tenant = tenant_for_order(order_id);
+    let offset = draw % limit.max(1).min(10_000);
+    let candidate = (tenant - 1) * 10_000 + offset + 1;
+    if candidate == 0 {
+        1 + crate::generator::mix64(seed ^ table.tag()) % limit.max(1)
+    } else {
+        candidate
+    }
+}
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -235,7 +302,8 @@ fn escape(v: &str) -> String {
         .replace('\r', "\\r")
 }
 fn json(v: u64, k: &str) -> String {
-    format!(r#"{{"{}":{},"version":1}}"#, k, v % 1000)
+    let extra = "x".repeat((v % 32) as usize);
+    format!(r#"{{"{}":{},"version":1,"tag":"{}"}}"#, k, v % 1000, extra)
 }
 fn format_timestamp(seconds: i64) -> String {
     format!(
@@ -266,6 +334,58 @@ mod tests {
         assert_eq!(
             DeterministicGenerator::new(1).row(Table::Tenants, 4),
             DeterministicGenerator::new(1).row(Table::Tenants, 4)
+        );
+    }
+    #[test]
+    fn relationships_are_same_tenant_and_prefix_stable() {
+        let g = DeterministicGenerator::new(20260901);
+        for id in 1..1000 {
+            let Row::Orders {
+                tenant_id,
+                customer_id,
+                ..
+            } = g.row(Table::Orders, id)
+            else {
+                unreachable!()
+            };
+            let Row::Customers {
+                tenant_id: customer_tenant,
+                ..
+            } = g.row(Table::Customers, customer_id)
+            else {
+                unreachable!()
+            };
+            assert_eq!(tenant_id, customer_tenant);
+            let Row::OrderEvents {
+                order_id,
+                tenant_id: event_tenant,
+                ..
+            } = g.row(Table::OrderEvents, id)
+            else {
+                unreachable!()
+            };
+            let Row::Orders {
+                tenant_id: order_tenant,
+                ..
+            } = g.row(Table::Orders, order_id)
+            else {
+                unreachable!()
+            };
+            assert_eq!(event_tenant, order_tenant);
+        }
+        let short = g.copy_batch(Table::Orders, 1..20).unwrap();
+        let long = g.copy_batch(Table::Orders, 1..40).unwrap();
+        assert!(long.bytes.starts_with(&short.bytes));
+    }
+    #[test]
+    fn cycle_allocator_is_deterministic() {
+        assert_eq!(cycle_ranges(3), cycle_ranges(3));
+        assert_eq!(
+            cycle_ranges(1)
+                .iter()
+                .map(|r| r.range.end - r.range.start)
+                .sum::<u64>(),
+            86
         );
     }
 }
