@@ -71,20 +71,42 @@
 - Ruling: use a linked worktree on `codex/r1-phase-1` — the approved execution plan requires isolation and preserves `main`; cost if wrong: extra branch cleanup work.
 - Ruling: keep service-dependent integration tests ignored until Task 11 creates the Compose environment — this preserves task independence without weakening the tests; cost if wrong: integration failures surface later than unit failures.
 - Ruling: run the controller on the host while databases run in Compose — the user asked to see terminal logs, and this keeps the data-plane services independently killable; cost if wrong: host controller resource usage must be captured for fairness.
+- Ruling: treat the Task 3 distribution and JSON ordering gaps as load-bearing — Task 4 manifests and later correctness reports depend on the frozen generator shape matching spec section 4.2; cost if wrong: extra generator rework if the final re-review had already accepted the current implementation.
 
 ## Dispatch
 
 - Task 1 implementer: `/root/r1_task1_contracts` (`gpt-5.4-mini`, medium), brief `task-1-brief.md`, report `task-1-report.md`, BASE `4b9a2ce`.
 - Task 2 implementer: `/root/r1_task2_artifacts` (`gpt-5.4-mini`, medium), brief `task-2-brief.md`, report `task-2-report.md`, BASE `4bac4e3`.
 - Task 2 reviewer: `/root/r1_task2_review` (`gpt-5.5`, medium), package `review-4bac4e3..e5519e7.diff`, FAIL; fix round 1 dispatched to original implementer.
+- Task 2 fix commit: `74e1358`; scoped re-review `/root/r1_task2_rereview` (`gpt-5.4`, medium), package `review-e5519e7..74e1358.diff`, PASS; no new in-scope regressions.
+- Task 3 implementer: `/root/r1_task3_generator` (`gpt-5.6-luna`, medium), brief `task-3-brief.md`, report `task-3-report.md`, BASE `74e1358`.
+- Task 3 reviewer: `/root/r1_task3_review` (`gpt-5.5`, medium), package `review-74e1358..164e99d.diff`, FAIL; fix round 1 dispatched to original implementer.
+- Task 3 fix commit: `6c8a0e6`; scoped re-review `/root/r1_task3_rereview` (`gpt-5.4`, medium), package `review-164e99d..6c8a0e6.diff`, pending.
+- Task 3 re-reviewer `/root/r1_task3_rereview` and replacement `/root/r1_task3_rereview_alt` errored on the platform usage limit; retry `/root/r1_task3_rereview_retry` (`gpt-5.4-mini`, low) completed a scoped review and found one remaining P1 canonical-column-order gap; fix round 2 dispatched to original implementer.
+- Task 3 fix round 2 commit `58f7271` addressed canonical permutation normalization, but the implementer self-identified a concrete cycle relationship violation; fix round 3 dispatched before re-review.
+- Task 3 fix round 3 commit `a9b1032`; cumulative scoped re-review `/root/r1_task3_rereview_final` (`gpt-5.5`, medium), package `review-164e99d..a9b1032.diff`, pending.
+- Task 3 fix round 4: final scoped re-review artifact did not materialize after resume; controller inspection found generator distribution and JSON ordering gaps against spec section 4.2; fresh implementer will own the fix from BASE `a9b1032`.
+- Task 3 fix round 4/5 (1 addressed, 1 open — JSON ordering/dictionary distribution addressed; tenant activity Zipf remains metadata-only; commits `a9b1032`..`5b463e7`).
+- Task 3 fix round 5: fresh escalated implementer will address tenant activity skew in actual generated ownership while preserving prefix-safe referential validity from BASE `5b463e7`.
+- Task 3 fix round 5/5 (1 addressed, 0 open — tenant activity Zipf now controls generated customer/order/event ownership; commits `5b463e7`..`c6078b2`).
+- Task 3 scoped re-review round 5: `/root` delegated via Codex task `01a05c85-a72b-7d02-8229-21f809b3e92c` (`gpt-5.6-terra`, medium), package `review-5b463e7..c6078b2.diff`, PASS.
+- Task 4 implementer: Codex task `01a05c87-998d-7f11-9a9a-36b05a727d25` (`gpt-5.6-terra`, medium), brief `task-4-brief.md`, report `task-4-report.md`, BASE `c6078b2`.
+- Task 4 reviewer: `/root/r1_task4_review` (`gpt-5.4`, medium), package `review-c6078b2..0bebe37.diff`, pending.
+- Task 4 initial review: FAIL; P1 real manifest identity/per-table metrics missing and P2 cumulative `analyze_ms` understated. Fix round 1 sent to original Codex implementer task `01a05c87-998d-7f11-9a9a-36b05a727d25`.
+- Task 4 fix commit: `5b3d0ee`; scoped re-review `/root/r1_task4_rereview` (`gpt-5.4-mini`, low), package `review-0bebe37..5b3d0ee.diff`, pending.
+- Task 4 scoped re-review: PASS; real identity/size metadata and cumulative timing are addressed with no new in-scope findings.
+- Task 5 implementer: `/root/r1_task5_workload` (`gpt-5.6-luna`, medium), brief `task-5-brief.md`, report `task-5-report.md`, BASE `5b3d0ee`.
+- Task 5 reviewer: `/root/r1_task5_review` (`gpt-5.4`, medium), package `review-5b3d0ee..8f91358.diff`, initial FAIL recorded locally because the review artifact did not materialize.
+- Task 5 fix round 1: local root fix from `8f91358` to current HEAD corrected frozen transaction sizes, schema-ready operation payloads, per-table routing, and minute-bucket rate accounting.
+- Task 5 scoped re-review: PASS after fix round 1; workload and ledger suites are green, and only the pre-existing `graydb-registry` clippy warning remains outside scope.
 
 ## Task status
 
 - Task 1: complete (commits `03ccc09`..`4bac4e3`, review clean after fix round 1)
-- Task 2: in progress (implementation `e5519e7`; review found runtime-resource preflight and task-local formatting gaps; fix round 1 active)
-- Task 3: pending
-- Task 4: pending
-- Task 5: pending
+- Task 2: complete (commits `e5519e7`..`74e1358`; scoped re-review PASS after fix round 1)
+- Task 3: complete (commits `164e99d`..`c6078b2`, review clean after fix round 5)
+- Task 4: complete (commits `0bebe37`..`5b3d0ee`; scoped re-review PASS after fix round 1)
+- Task 5: complete (implementation `8f91358`; local fix round 1 and scoped re-review PASS)
 - Task 6: pending
 - Task 7: pending
 - Task 8: pending
@@ -107,3 +129,17 @@
 - Fix commit: `4bac4e3bca5530b24eb5e13d206cf8efcfc2c756`; fix report appended with focused test evidence.
 - Scoped re-review: `/root/r1_task1_rereview` (`gpt-5.4`, medium), package `review-03ccc09..4bac4e3.diff`, complete.
 - Scoped re-review verdict: PASS for spec compliance and task quality; both findings ADDRESSED; no new breakage.
+
+## Task 2 execution
+
+- Implementer status: complete; initial commit `e5519e7`, fix commit `74e1358`.
+- Focused artifact/preflight tests: PASS; task-local `cargo fmt -p graydb-r1 -- --check`: PASS.
+- Initial review: FAIL for hard-coded runtime resources and Task 2 formatting drift; repo-wide clippy failures were baseline/unrelated.
+- Scoped re-review: PASS; runtime resource parsing/failure behavior and task-local formatting addressed; no new in-scope regressions.
+
+## Task 4 execution
+
+- Implementer status: complete; initial commit `0bebe37`, fix commit `5b3d0ee`.
+- Manifest/generator tests, ignored PostgreSQL integration compile, and workspace tests: PASS per implementer report; service integration remains intentionally ignored until Task 11.
+- Initial review: FAIL for placeholder identity/per-table metadata and non-cumulative `analyze_ms`.
+- Scoped re-review: PASS; PostgreSQL identity/size metadata and cumulative timing addressed; no new in-scope regressions.
