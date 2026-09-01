@@ -11,8 +11,9 @@ pub use contracts::{
 };
 pub use generator::{CopyBatch, DeterministicGenerator, Row, Table};
 pub use manifest::{
-    BatchManifest, CopySink, DatasetIdentity, DatasetLoader, DatasetManifest, PostgresCopySink,
-    PostgresPublishedSizeProbe, PublishedSizeProbe, TableManifest, PUBLISHED_TABLE_BYTES_SQL,
+    BatchManifest, CopySink, DatasetIdentity, DatasetLoader, DatasetManifest, DatasetProbeMetadata,
+    PostgresCopySink, PostgresPublishedSizeProbe, PublishedSizeProbe, TableManifest,
+    PUBLISHED_TABLE_BYTES_SQL,
 };
 pub use preflight::{
     PreflightFailure, PreflightPolicy, PreflightProbe, PreflightReport, PreflightSnapshot,

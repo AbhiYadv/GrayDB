@@ -18,6 +18,24 @@ pub const PUBLISHED_TABLE_BYTES_SQL: &str = "SELECT sum(pg_table_size(c.oid))::b
 #[async_trait]
 pub trait PublishedSizeProbe: Send {
     async fn published_size(&mut self) -> Result<u64>;
+
+    async fn initial_lsn(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn manifest_metadata(&mut self) -> Result<DatasetProbeMetadata> {
+        Ok(DatasetProbeMetadata::default())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatasetProbeMetadata {
+    pub schema_sha256: String,
+    pub dictionary_sha256: String,
+    pub postgres_version: String,
+    pub postgres_settings: BTreeMap<String, String>,
+    pub initial_lsn: Option<String>,
+    pub tables: BTreeMap<String, TableManifest>,
 }
 
 #[async_trait]
@@ -82,6 +100,72 @@ impl PublishedSizeProbe for PostgresPublishedSizeProbe {
             .unwrap_or(0)
             .try_into()
             .context("published table size was negative")?)
+    }
+
+    async fn manifest_metadata(&mut self) -> Result<DatasetProbeMetadata> {
+        const SCHEMA_SQL: &str = include_str!("../../../bench/r1/schema.sql");
+        const DICTIONARIES_JSON: &str = include_str!("../../../bench/r1/dictionaries.json");
+        let postgres_version: String = self
+            .client
+            .query_one("SHOW server_version", &[])
+            .await?
+            .get(0);
+        let mut postgres_settings = BTreeMap::new();
+        for setting in ["block_size", "server_version_num", "wal_level"] {
+            let value: String = self
+                .client
+                .query_one(&format!("SHOW {setting}"), &[])
+                .await?
+                .get(0);
+            postgres_settings.insert(setting.to_string(), value);
+        }
+        let rows = self.client.query("SELECT c.relname, pg_table_size(c.oid)::bigint, pg_indexes_size(c.oid)::bigint, pg_total_relation_size(c.oid)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_publication_tables p ON p.schemaname = n.nspname AND p.tablename = c.relname WHERE p.pubname = 'graydb_r1_pub' ORDER BY c.relname", &[]).await?;
+        let mut tables = BTreeMap::new();
+        for row in rows {
+            let name: String = row.get(0);
+            let existing_rows: i64 = self
+                .client
+                .query_one(&format!("SELECT count(*) FROM r1.{name}"), &[])
+                .await?
+                .get(0);
+            tables.insert(
+                name,
+                TableManifest {
+                    rows: existing_rows
+                        .try_into()
+                        .context("table row count was negative")?,
+                    table_bytes: row
+                        .get::<_, i64>(1)
+                        .try_into()
+                        .context("table bytes were negative")?,
+                    index_bytes: row
+                        .get::<_, i64>(2)
+                        .try_into()
+                        .context("index bytes were negative")?,
+                    total_relation_bytes: row
+                        .get::<_, i64>(3)
+                        .try_into()
+                        .context("total relation bytes were negative")?,
+                },
+            );
+        }
+        Ok(DatasetProbeMetadata {
+            schema_sha256: sha256(SCHEMA_SQL.as_bytes()),
+            dictionary_sha256: sha256(DICTIONARIES_JSON.as_bytes()),
+            postgres_version,
+            postgres_settings,
+            initial_lsn: None,
+            tables,
+        })
+    }
+
+    async fn initial_lsn(&mut self) -> Result<Option<String>> {
+        Ok(Some(
+            self.client
+                .query_one("SELECT pg_current_wal_lsn()::text", &[])
+                .await?
+                .get(0),
+        ))
     }
 }
 
@@ -216,10 +300,12 @@ where
     /// published size. Table metrics can be enriched by the PostgreSQL runner.
     pub async fn load_until(mut self, minimum_bytes: u64) -> Result<DatasetManifest> {
         let started = now_ms();
+        let initial_lsn = self.probe.initial_lsn().await?;
         let mut generation_ms = 0;
         let mut copy_ms = 0;
         let mut batches = Vec::new();
         let mut tables = BTreeMap::new();
+        let mut analyze_ms = 0;
         for cycle in 1.. {
             for range in cycle_ranges(cycle)
                 .into_iter()
@@ -253,18 +339,26 @@ where
             // Concrete PostgreSQL sinks run ANALYZE before their probe; keeping it
             // out of this generic seam makes the measured loop service-testable.
             let published_table_bytes = self.probe.published_size().await?;
-            let analyze_ms = analyzed_at.elapsed().as_millis();
+            analyze_ms += analyzed_at.elapsed().as_millis();
             if published_table_bytes >= minimum_bytes {
+                let metadata = self.probe.manifest_metadata().await?;
+                for (name, measured) in metadata.tables {
+                    let rows = tables
+                        .get(&name)
+                        .map(|loaded| loaded.rows)
+                        .unwrap_or(measured.rows);
+                    tables.insert(name, TableManifest { rows, ..measured });
+                }
                 return Ok(DatasetManifest {
                     seed: self.generator.seed,
-                    schema_sha256: String::new(),
-                    dictionary_sha256: String::new(),
+                    schema_sha256: metadata.schema_sha256,
+                    dictionary_sha256: metadata.dictionary_sha256,
                     published_table_bytes,
                     tables,
                     batches,
-                    postgres_version: String::new(),
-                    postgres_settings: BTreeMap::new(),
-                    initial_lsn: None,
+                    postgres_version: metadata.postgres_version,
+                    postgres_settings: metadata.postgres_settings,
+                    initial_lsn: initial_lsn.or(metadata.initial_lsn),
                     load_started_unix_ms: started,
                     load_finished_unix_ms: now_ms(),
                     generation_ms,
@@ -291,21 +385,52 @@ fn now_ms() -> u128 {
         .expect("system time before epoch")
         .as_millis()
 }
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    struct FakeSizeProbe(VecDeque<u64>);
+    struct FakeSizeProbe {
+        values: VecDeque<u64>,
+        metadata: DatasetProbeMetadata,
+    }
     impl FakeSizeProbe {
         fn new(values: impl IntoIterator<Item = u64>) -> Self {
-            Self(values.into_iter().collect())
+            Self {
+                values: values.into_iter().collect(),
+                metadata: DatasetProbeMetadata {
+                    schema_sha256: "schema-hash".into(),
+                    dictionary_sha256: "dictionary-hash".into(),
+                    postgres_version: "16.1".into(),
+                    postgres_settings: BTreeMap::from([("block_size".into(), "8192".into())]),
+                    initial_lsn: Some("0/ABC".into()),
+                    tables: BTreeMap::from([(
+                        "tenants".into(),
+                        TableManifest {
+                            rows: 3,
+                            table_bytes: 400,
+                            index_bytes: 40,
+                            total_relation_bytes: 440,
+                        },
+                    )]),
+                },
+            }
         }
     }
     #[async_trait]
     impl PublishedSizeProbe for FakeSizeProbe {
         async fn published_size(&mut self) -> Result<u64> {
-            Ok(self.0.pop_front().unwrap())
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Ok(self.values.pop_front().unwrap())
+        }
+        async fn manifest_metadata(&mut self) -> Result<DatasetProbeMetadata> {
+            Ok(self.metadata.clone())
+        }
+        async fn initial_lsn(&mut self) -> Result<Option<String>> {
+            Ok(Some("0/INITIAL".into()))
         }
     }
     #[derive(Default)]
@@ -329,6 +454,16 @@ mod tests {
         let manifest = loader.load_until(1_000).await.unwrap();
         assert_eq!(manifest.published_table_bytes, 1_200);
         assert_eq!(manifest.batches.len(), 12);
+        assert_eq!(manifest.schema_sha256, "schema-hash");
+        assert_eq!(manifest.dictionary_sha256, "dictionary-hash");
+        assert_eq!(manifest.postgres_version, "16.1");
+        assert_eq!(manifest.initial_lsn.as_deref(), Some("0/INITIAL"));
+        assert_eq!(manifest.tables["tenants"].table_bytes, 400);
+        assert!(
+            manifest.analyze_ms >= 6,
+            "analyze_ms={}",
+            manifest.analyze_ms
+        );
     }
     fn fixture_manifest() -> DatasetManifest {
         DatasetManifest {
