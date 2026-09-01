@@ -388,4 +388,32 @@ mod tests {
             86
         );
     }
+    #[test]
+    fn first_cycle_orders_and_events_reference_loaded_prefix_rows() {
+        let g = DeterministicGenerator::new(20260901);
+        for id in 1..=20 {
+            let Row::Orders {
+                tenant_id,
+                customer_id,
+                ..
+            } = g.row(Table::Orders, id)
+            else {
+                unreachable!()
+            };
+            assert_eq!(tenant_id, 1);
+            assert!((1..=5).contains(&customer_id));
+        }
+        for id in 1..=60 {
+            let Row::OrderEvents {
+                tenant_id,
+                order_id,
+                ..
+            } = g.row(Table::OrderEvents, id)
+            else {
+                unreachable!()
+            };
+            assert_eq!(tenant_id, 1);
+            assert!((1..=20).contains(&order_id));
+        }
+    }
 }

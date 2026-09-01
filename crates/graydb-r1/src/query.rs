@@ -75,8 +75,10 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Option<String>>>,
 }
 pub fn canonical_digest(result: &QueryResult) -> String {
+    let order = canonical_column_order(&result.columns);
     let mut encoded = Vec::new();
-    for column in &result.columns {
+    for &index in &order {
+        let column = &result.columns[index];
         encoded.extend_from_slice(column.len().to_string().as_bytes());
         encoded.push(b':');
         encoded.extend_from_slice(column.as_bytes());
@@ -87,7 +89,11 @@ pub fn canonical_digest(result: &QueryResult) -> String {
         .iter()
         .map(|row| {
             let mut out = Vec::new();
-            for v in row {
+            for &index in &order {
+                let Some(v) = row.get(index) else {
+                    out.extend_from_slice(b"M;");
+                    continue;
+                };
                 match v {
                     None => out.extend_from_slice(b"N;"),
                     Some(s) => {
@@ -108,6 +114,23 @@ pub fn canonical_digest(result: &QueryResult) -> String {
     let mut h = Sha256::new();
     h.update(encoded);
     encode_hex(&h.finalize())
+}
+fn canonical_column_order(columns: &[String]) -> Vec<usize> {
+    let mut indexes: Vec<usize> = (0..columns.len()).collect();
+    indexes.sort_by_key(|&i| {
+        let rank = match columns[i].as_str() {
+            "customer_id" => 0,
+            "region" => 0,
+            "status" => 0,
+            "event_type" => 0,
+            "channel" => 1,
+            "sum(amount_cents)" | "revenue_cents" => 3,
+            "count" | "count(*)" | "order_count" => 4,
+            _ => 100,
+        };
+        (rank, columns[i].clone(), i)
+    });
+    indexes
 }
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -159,6 +182,41 @@ mod tests {
         let c = QueryResult {
             columns: a.columns.clone(),
             rows: vec![vec![Some("ab".into())], vec![Some("c".into())]],
+        };
+        assert_ne!(canonical_digest(&a), canonical_digest(&c));
+    }
+    #[test]
+    fn digest_normalizes_column_order_but_not_column_identity() {
+        let a = QueryResult {
+            columns: vec!["tenant_id".into(), "status".into()],
+            rows: vec![vec![Some("42".into()), Some("paid".into())]],
+        };
+        let b = QueryResult {
+            columns: vec!["status".into(), "tenant_id".into()],
+            rows: vec![vec![Some("paid".into()), Some("42".into())]],
+        };
+        assert_eq!(canonical_digest(&a), canonical_digest(&b));
+
+        let c = QueryResult {
+            columns: vec!["tenant_id".into(), "channel".into()],
+            rows: vec![vec![Some("42".into()), Some("paid".into())]],
+        };
+        assert_ne!(canonical_digest(&a), canonical_digest(&c));
+    }
+    #[test]
+    fn digest_normalizes_declared_columns_and_cells() {
+        let a = QueryResult {
+            columns: vec!["status".into(), "count".into()],
+            rows: vec![vec![Some("paid".into()), Some("7".into())]],
+        };
+        let b = QueryResult {
+            columns: vec!["count".into(), "status".into()],
+            rows: vec![vec![Some("7".into()), Some("paid".into())]],
+        };
+        assert_eq!(canonical_digest(&a), canonical_digest(&b));
+        let c = QueryResult {
+            columns: vec!["status".into(), "unknown".into()],
+            rows: vec![vec![Some("paid".into()), Some("7".into())]],
         };
         assert_ne!(canonical_digest(&a), canonical_digest(&c));
     }
