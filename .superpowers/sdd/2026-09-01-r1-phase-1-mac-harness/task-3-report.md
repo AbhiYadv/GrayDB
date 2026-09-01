@@ -51,3 +51,24 @@ key order fails if map ordering regresses.
 - `cargo test -p graydb-r1 generator::tests -- --nocapture` — passed (8 tests).
 - `cargo test -p graydb-r1 query::tests -- --nocapture` — passed (4 tests).
 - `cargo test -p graydb-r1 -- --nocapture` — passed (19 unit tests; 0 doc tests).
+
+## Fix round 5
+
+Moved bounded Zipf tenant activity from tenant metadata into actual generated
+ownership. Each customer deterministically selects a tenant rank from the
+already-loaded tenant-cycle prefix, capped at 64 ranks; orders inherit the
+selected customer's tenant and events inherit the selected order's tenant.
+Customer and order references remain cycle-local, so every relationship exists
+before it is referenced and generation remains prefix-stable. Updated the
+distribution artifact to version 3 with the ownership rule.
+
+Added regressions that measure materially skewed customer, order, and event
+ownership across 512 complete cycles and verify every referenced tenant is
+present in the progressively loaded tenant-cycle prefix. The ownership
+regression failed against the round-4 implementation with equal hot/cold
+customer counts (`hot=5, cold=5`) before passing with the fix.
+
+- `cargo fmt --package graydb-r1` — passed.
+- `cargo test -p graydb-r1 generator::tests -- --nocapture` — passed (10 tests).
+- `cargo test -p graydb-r1 query::tests -- --nocapture` — passed (4 tests).
+- `cargo test -p graydb-r1 -- --nocapture` — passed (21 unit tests; 0 doc tests).

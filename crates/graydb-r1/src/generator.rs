@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 pub const COPY_BATCH_ROWS: u64 = 100_000;
+const MAX_TENANT_ACTIVITY_RANK: u64 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRange {
@@ -117,14 +118,20 @@ impl DeterministicGenerator {
         Ok(out)
     }
     pub fn row(&self, table: Table, id: u64) -> Row {
-        let selected_customer =
-            customer_for_order(self.seed, table, id, self.draw(table, id, 7), id);
         let selected_order = order_for_event(id, self.draw(table, id, 3));
+        let selected_customer = match table {
+            Table::OrderEvents => {
+                customer_for_order(selected_order, self.draw(Table::Orders, selected_order, 7))
+            }
+            _ => customer_for_order(id, self.draw(Table::Orders, id, 7)),
+        };
         let tenant = match table {
             Table::Tenants => id,
-            Table::Customers => tenant_for_customer(id),
-            Table::Orders => tenant_for_customer(selected_customer),
-            Table::OrderEvents => tenant_for_order(selected_order),
+            Table::Customers => tenant_for_customer(id, self.draw(Table::Customers, id, 11)),
+            Table::Orders | Table::OrderEvents => tenant_for_customer(
+                selected_customer,
+                self.draw(Table::Customers, selected_customer, 11),
+            ),
         };
         // Squaring the bounded draw concentrates records toward the recent end.
         let age = self.draw(table, id, 2) % 31_536_000;
@@ -262,14 +269,12 @@ impl DeterministicGenerator {
         }
     }
 }
-fn tenant_for_customer(id: u64) -> u64 {
-    cycle_base(id) + 1
+fn tenant_for_customer(id: u64, draw: u64) -> u64 {
+    let loaded_tenants = cycle_base(id) / 100 + 1;
+    let rank = bounded_zipf_rank(draw, loaded_tenants.min(MAX_TENANT_ACTIVITY_RANK));
+    (rank - 1) * 100 + 1
 }
-fn tenant_for_order(id: u64) -> u64 {
-    cycle_base(id) + 1
-}
-fn customer_for_order(seed: u64, table: Table, order_id: u64, draw: u64, limit: u64) -> u64 {
-    let _ = (seed, table, limit);
+fn customer_for_order(order_id: u64, draw: u64) -> u64 {
     cycle_base(order_id) + 1 + draw % 5
 }
 fn cycle_base(id: u64) -> u64 {
@@ -368,7 +373,7 @@ fn json(v: u64, k: &str) -> String {
     if k == "tenant" {
         object.insert(
             "activity_rank".to_string(),
-            Value::from(bounded_zipf_rank(v)),
+            Value::from(bounded_zipf_rank(v, MAX_TENANT_ACTIVITY_RANK)),
         );
     }
     object.insert("kind".to_string(), Value::from(k));
@@ -380,11 +385,11 @@ fn json(v: u64, k: &str) -> String {
     );
     serde_json::to_string(&object).expect("ordered JSON metadata")
 }
-fn bounded_zipf_rank(draw: u64) -> u64 {
-    const MAX_RANK: u64 = 64;
-    let total = (1..=MAX_RANK).map(|rank| 10_000 / rank).sum::<u64>();
+fn bounded_zipf_rank(draw: u64, max_rank: u64) -> u64 {
+    debug_assert!(max_rank > 0 && max_rank <= MAX_TENANT_ACTIVITY_RANK);
+    let total = (1..=max_rank).map(|rank| 10_000 / rank).sum::<u64>();
     let mut slot = draw % total;
-    for rank in 1..=MAX_RANK {
+    for rank in 1..=max_rank {
         let weight = 10_000 / rank;
         if slot < weight {
             return rank;
@@ -610,5 +615,63 @@ mod tests {
         }
         assert!(ranks[&1] > ranks[&2]);
         assert!(ranks.len() > 8);
+    }
+
+    #[test]
+    fn generated_ownership_is_materially_skewed_across_complete_cycles() {
+        let g = DeterministicGenerator::new(20260901);
+        let mut customer_counts = BTreeMap::new();
+        let mut order_counts = BTreeMap::new();
+        let mut event_counts = BTreeMap::new();
+
+        for table_range in cycle_ranges(512) {
+            for id in table_range.range {
+                let (counts, tenant_id) = match g.row(table_range.table, id) {
+                    Row::Customers { tenant_id, .. } => (&mut customer_counts, tenant_id),
+                    Row::Orders { tenant_id, .. } => (&mut order_counts, tenant_id),
+                    Row::OrderEvents { tenant_id, .. } => (&mut event_counts, tenant_id),
+                    Row::Tenants { .. } => continue,
+                };
+                *counts.entry(tenant_id).or_insert(0_u64) += 1;
+            }
+        }
+
+        let hot_tenant = 1;
+        let cold_tenant = 1_501;
+        for (kind, counts) in [
+            ("customers", customer_counts),
+            ("orders", order_counts),
+            ("events", event_counts),
+        ] {
+            let hot = counts.get(&hot_tenant).copied().unwrap_or_default();
+            let cold = counts.get(&cold_tenant).copied().unwrap_or_default();
+            assert!(cold > 0, "cold tenant has no generated {kind}");
+            assert!(
+                hot > cold * 5,
+                "expected materially skewed {kind} ownership: hot={hot}, cold={cold}"
+            );
+        }
+    }
+
+    #[test]
+    fn referenced_tenants_are_present_in_the_loaded_cycle_prefix() {
+        let g = DeterministicGenerator::new(20260901);
+        let mut loaded_tenants = std::collections::BTreeSet::new();
+
+        for table_range in cycle_ranges(256) {
+            for id in table_range.range {
+                match g.row(table_range.table, id) {
+                    Row::Tenants { tenant_id, .. } => {
+                        loaded_tenants.insert(tenant_id);
+                    }
+                    Row::Customers { tenant_id, .. }
+                    | Row::Orders { tenant_id, .. }
+                    | Row::OrderEvents { tenant_id, .. } => assert!(
+                        loaded_tenants.contains(&tenant_id),
+                        "tenant {tenant_id} was referenced before its cycle was loaded"
+                    ),
+                }
+            }
+        }
     }
 }
