@@ -5,6 +5,7 @@ pub mod ledger;
 pub mod manifest;
 pub mod preflight;
 pub mod query;
+pub mod replication;
 pub mod workload;
 
 pub use artifacts::{sha256_tree, Event, EventLevel, EventRender, EventSink, RunDirectory};
@@ -23,6 +24,10 @@ pub use preflight::{
     SnapshotPreflightProbe, SystemPreflightProbe,
 };
 pub use query::{canonical_digest, QueryId, QueryParameters, QuerySchedule};
+pub use replication::{
+    ApplicationWriter, ControlLsnMapper, ControlReplicationConfig, LedgerCommit, ReplayMap,
+    ReplayMapEntry, WorkloadReplayer,
+};
 pub use workload::{
     CustomerRow, Operation, OrderEventRow, OrderRow, RateInterval, RateLimiter, RowMix,
     TransactionPlan, WorkloadPlanner,
