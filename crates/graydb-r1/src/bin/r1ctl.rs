@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand};
-use graydb_r1::{sha256_tree, EngineKind, RunController, RunInvalidation, RunMode, ScaleProfile};
+use graydb_r1::{
+    mutation_fixtures, sha256_tree, BenchmarkRuntime, EngineKind, LifecycleStatus, ProfileCatalog,
+    RunController, RunMode, RunPlan, RunStage, ScaleProfile, StageContext, StageOutcome,
+    SystemProcessRunner,
+};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -85,24 +89,23 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
             let mut controller = RunController::create(&cli.run_root, &run_id)?;
             controller.note("operator requested benchmark run")?;
             print_run_header(&cli, &run_id, controller.run_root());
-            let _ = profile;
-            anyhow::bail!(
-                "run is incomplete: concrete benchmark services must be bound by the operator runtime before stage execution"
-            )
+            run_plan(&mut controller, profile, mode, engines)
         }
         Command::Resume { run_id } => {
             let mut controller = RunController::resume(&cli.run_root, &run_id)?;
             controller.note("operator requested resume")?;
             print_run_header(&cli, &run_id, controller.run_root());
-            if controller.state().is_complete() {
-                Ok(())
-            } else if controller.state().is_invalid() {
-                anyhow::bail!("run is invalid; only archived report and checksums are permitted")
-            } else {
-                anyhow::bail!(
-                    "run is incomplete; next durable stage is {:?}",
-                    controller.next_stage()
-                )
+            let plan = load_plan(
+                ScaleProfile::MacSmoke,
+                RunMode::Correctness,
+                vec![EngineKind::Graydb, EngineKind::Clickhouse],
+            )?;
+            let mut runtime = MacComposeRuntime;
+            match block_on(controller.run_to_terminal(&plan, &mut runtime))? {
+                LifecycleStatus::Complete => Ok(()),
+                LifecycleStatus::InvalidArchived => {
+                    anyhow::bail!("run is invalid and archived after report/checksums")
+                }
             }
         }
         Command::Preflight { run_id }
@@ -122,29 +125,24 @@ fn incomplete_subcommand(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
     };
     controller.note("operator requested a single controller subcommand")?;
     print_run_header(cli, run_id, controller.run_root());
-    anyhow::bail!("run is incomplete; execute through the bound benchmark runtime")
+    let plan = load_plan(
+        ScaleProfile::MacSmoke,
+        RunMode::Correctness,
+        vec![EngineKind::Graydb, EngineKind::Clickhouse],
+    )?;
+    let mut runtime = MacComposeRuntime;
+    match block_on(controller.run_to_terminal(&plan, &mut runtime))? {
+        LifecycleStatus::Complete => Ok(()),
+        LifecycleStatus::InvalidArchived => {
+            anyhow::bail!("run is invalid and archived after report/checksums")
+        }
+    }
 }
 
 fn self_test_invalidations(cli: &Cli) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cli.run_root)?;
     let log = cli.run_root.join("self-test-invalidations.log");
-    // These map exactly to the four Task 9 corruption fixtures.  This command
-    // is intentionally a proof-only operation and never creates a run result.
-    let rejected = [
-        RunInvalidation::MissingSequence(3),
-        RunInvalidation::DuplicateSequence(4),
-        RunInvalidation::StaleResult {
-            target_lsn: 103,
-            visible_lsn: 102,
-        },
-        RunInvalidation::ResultDigestMismatch {
-            query: graydb_r1::QueryId::Q5,
-            checkpoint: 105,
-        },
-    ];
-    if rejected.len() != 4 {
-        anyhow::bail!("not all Task 9 invalidation fixtures were rejected");
-    }
+    let rejected = mutation_fixtures::run_all()?;
     std::fs::write(
         &log,
         "self-test-invalidations: four Task 9 mutation fixtures rejected\n",
@@ -159,6 +157,97 @@ fn self_test_invalidations(cli: &Cli) -> anyhow::Result<()> {
         println!("four Task 9 mutation fixtures rejected; no benchmark result written");
     }
     Ok(())
+}
+
+fn run_plan(
+    controller: &mut RunController,
+    profile: ScaleProfile,
+    mode: RunMode,
+    engines: Vec<EngineKind>,
+) -> anyhow::Result<()> {
+    let plan = load_plan(profile, mode, engines)?;
+    let mut runtime = MacComposeRuntime;
+    match block_on(controller.run_to_terminal(&plan, &mut runtime))? {
+        LifecycleStatus::Complete => Ok(()),
+        LifecycleStatus::InvalidArchived => {
+            anyhow::bail!("run is invalid and archived after report/checksums")
+        }
+    }
+}
+
+fn load_plan(
+    profile: ScaleProfile,
+    mode: RunMode,
+    engines: Vec<EngineKind>,
+) -> anyhow::Result<RunPlan> {
+    let catalog = ProfileCatalog::load(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/r1/profiles.toml"),
+    )?;
+    Ok(RunPlan {
+        profile,
+        spec: catalog
+            .get(profile)
+            .ok_or_else(|| anyhow::anyhow!("profile missing"))?
+            .clone(),
+        mode,
+        engines,
+        input_hashes: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Concrete host path.  Preflight validates the actual Mac Compose topology
+/// before any later stage is allowed.  The intentionally narrow adapter fails
+/// closed rather than emitting fabricated benchmark evidence until the service
+/// runtime supplies the stage's real PostgreSQL/engine operations.
+struct MacComposeRuntime;
+
+#[async_trait::async_trait]
+impl BenchmarkRuntime for MacComposeRuntime {
+    async fn execute_stage(&mut self, context: StageContext<'_>) -> anyhow::Result<StageOutcome> {
+        if context.stage == RunStage::Preflight {
+            let compose = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bench/r1/compose.yml");
+            let args = vec![
+                "compose".into(),
+                "-f".into(),
+                compose.display().to_string(),
+                "config".into(),
+                "--quiet".into(),
+            ];
+            let outcome = graydb_r1::ProcessRunner::run(&SystemProcessRunner, "docker", &args)?;
+            if !outcome.is_success() {
+                anyhow::bail!("Mac Compose preflight unavailable: {}", outcome.stderr);
+            }
+            return Ok(StageOutcome {
+                command_outcomes: vec![outcome],
+                artifact_paths: vec!["environment.json".into()],
+                ..Default::default()
+            });
+        }
+        if context.stage == RunStage::Report {
+            let reason = context.invalidations.first().cloned().ok_or_else(|| {
+                anyhow::anyhow!("report stage requires an invalidation or result runtime")
+            })?;
+            let result = graydb_r1::RunResult::invalid(reason);
+            graydb_r1::ReportWriter::write(context.run_root, &result)?;
+            return Ok(StageOutcome {
+                artifact_paths: vec![
+                    "result.json".into(),
+                    "result.md".into(),
+                    "aws-capacity-request.json".into(),
+                ],
+                ..Default::default()
+            });
+        }
+        if context.stage == RunStage::Checksums {
+            sha256_tree(context.run_root)?;
+            return Ok(StageOutcome {
+                artifact_paths: vec!["SHA256SUMS".into()],
+                ..Default::default()
+            });
+        }
+        anyhow::bail!("Mac Compose runtime has no live service binding for {:?}; resume repeats this durably-started stage", context.stage)
+    }
 }
 
 fn print_run_header(cli: &Cli, run_id: &str, root: &Path) {
@@ -198,6 +287,13 @@ fn new_run_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("r1-{millis}")
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(future)
 }
 
 #[allow(dead_code)]

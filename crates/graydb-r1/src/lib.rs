@@ -27,14 +27,16 @@ pub use contracts::{
     EngineKind, LogicalCheckpoint, ProfileCatalog, ProfileSpec, RunConfig, RunMode, ScaleProfile,
 };
 pub use controller::{
-    free_space_sample_interval, pause_for_free_space, rate_search_stop, validate_workload_hashes,
-    BaselineSnapshot, CommandOutcome, ProcessRunner, QueryStagePolicy, RateSearchObservation,
-    RunController, RunStage, RunState, StageOutcome, StageRecord, SystemProcessRunner,
+    build_isolated_replays, free_space_sample_interval, pause_for_free_space, rate_search_stop,
+    validate_workload_hashes, BaselineSnapshot, BenchmarkRuntime, CommandOutcome,
+    IsolatedReplayEvidence, LifecycleStatus, ProcessRunner, QueryStagePolicy,
+    RateSearchObservation, RunController, RunPlan, RunStage, RunState, StageContext, StageOutcome,
+    StageQueryRecord, StageRecord, SystemProcessRunner,
 };
 pub use failure::{
-    controller_restart_exit_code, ComposeControl, EngineFailureResult, FailureRunner,
-    FailureSequenceResult, FailureWorkload, SystemComposeControl, CATCHUP_TIMEOUT, CDC_OUTAGE,
-    CONTROLLER_RESTART_EXIT_CODE, ENGINE_OUTAGE, WRITER_OUTAGE,
+    controller_restart_exit_code, CdcEndpoint, ComposeControl, EngineFailureResult,
+    FailureEvidence, FailureRunner, FailureSequenceResult, FailureWorkload, SystemComposeControl,
+    CATCHUP_TIMEOUT, CDC_OUTAGE, CONTROLLER_RESTART_EXIT_CODE, ENGINE_OUTAGE, WRITER_OUTAGE,
 };
 pub use generator::{CopyBatch, DeterministicGenerator, Row, Table};
 pub use graydb::GrayDbAdapter;
@@ -48,6 +50,7 @@ pub use metrics::{
     FreshnessMetricKey, LatencySeries, LatencySummary, Metrics, QueryMetricKey, RawMetricSample,
     ResourceSample, ResourceSampler, StageTimer, StageTiming,
 };
+pub use oracle::mutation_fixtures;
 pub use oracle::{
     CapturedCheckpoint, CheckpointVerdictSink, CorrectnessVerdict, EngineCheckpointEvidence,
     LedgerOracle, PostgresCheckpoint, RowDifference, RowSample, SampledCheckpointEngine,

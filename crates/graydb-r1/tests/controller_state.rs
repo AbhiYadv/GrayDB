@@ -1,6 +1,8 @@
 use graydb_r1::{
-    CommandOutcome, ComposeControl, CorrectnessVerdict, EngineKind, FailureRunner, FailureWorkload,
-    RunController, RunStage,
+    BenchmarkRuntime, CommandOutcome, ComposeControl, CorrectnessVerdict, EngineKind,
+    FailureRunner, FailureWorkload, IsolatedReplayEvidence, LifecycleStatus, ProfileCatalog,
+    RunController, RunMode, RunPlan, RunStage, ScaleProfile, StageContext, StageOutcome,
+    StageQueryRecord,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,9 +70,15 @@ fn invalidated_run_only_allows_report_then_checksums() {
         .expect("persist invalidation");
     assert_eq!(controller.next_stage(), Some(RunStage::Report));
     controller
+        .begin_stage(RunStage::Report, BTreeMap::new())
+        .unwrap();
+    controller
         .complete_stage(RunStage::Report, Default::default())
         .expect("report stays available after invalidation");
     assert_eq!(controller.next_stage(), Some(RunStage::Checksums));
+    controller
+        .begin_stage(RunStage::Checksums, BTreeMap::new())
+        .unwrap();
     controller
         .complete_stage(RunStage::Checksums, Default::default())
         .expect("checksums stay available after invalidation");
@@ -82,6 +90,9 @@ fn state_is_written_as_durable_json_not_a_partial_file() {
     let fixture = ControllerFixture::new();
     let mut controller = fixture.create();
     controller
+        .begin_stage(RunStage::Preflight, BTreeMap::new())
+        .unwrap();
+    controller
         .complete_stage(RunStage::Preflight, Default::default())
         .expect("persist stage");
 
@@ -91,6 +102,135 @@ fn state_is_written_as_durable_json_not_a_partial_file() {
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("run-state.json")).unwrap()).unwrap();
     assert_eq!(state["run_id"], fixture.run_id);
+}
+
+#[test]
+fn stage_cannot_complete_without_a_durable_start_record() {
+    let fixture = ControllerFixture::new();
+    let mut controller = fixture.create();
+    assert!(controller
+        .complete_stage(RunStage::Preflight, Default::default())
+        .is_err());
+}
+
+#[derive(Default)]
+struct LifecycleRuntime {
+    stages: Vec<RunStage>,
+}
+
+#[async_trait::async_trait]
+impl BenchmarkRuntime for LifecycleRuntime {
+    async fn execute_stage(&mut self, context: StageContext<'_>) -> anyhow::Result<StageOutcome> {
+        self.stages.push(context.stage);
+        let mut outcome = StageOutcome {
+            artifact_paths: vec![format!("artifacts/{:?}", context.stage)],
+            ..Default::default()
+        };
+        if context.policy.is_some() {
+            for query in [
+                graydb_r1::QueryId::Q1,
+                graydb_r1::QueryId::Q2,
+                graydb_r1::QueryId::Q3,
+                graydb_r1::QueryId::Q4,
+                graydb_r1::QueryId::Q5,
+            ] {
+                for _ in 0..30 {
+                    outcome.query_records.push(StageQueryRecord {
+                        query,
+                        started_at_unix_ms: 1,
+                        target_lsn: 10,
+                        visible_lsn: 10,
+                        canonical_digest: "digest".into(),
+                        elapsed_ns: 1,
+                        bytes_read: Some(1),
+                        failed: false,
+                    });
+                }
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+struct BadIsolatedRuntime(LifecycleRuntime);
+
+#[async_trait::async_trait]
+impl BenchmarkRuntime for BadIsolatedRuntime {
+    async fn execute_stage(&mut self, context: StageContext<'_>) -> anyhow::Result<StageOutcome> {
+        self.0.execute_stage(context).await
+    }
+    async fn prepare_isolated_replay(
+        &mut self,
+        _context: StageContext<'_>,
+    ) -> anyhow::Result<IsolatedReplayEvidence> {
+        Ok(IsolatedReplayEvidence {
+            workload_hashes: vec![vec!["a".into()], vec!["b".into()]],
+            replay_maps: vec![Vec::new(), Vec::new()],
+            logical_checkpoints: vec![1, 1],
+        })
+    }
+}
+
+#[tokio::test]
+async fn fake_runtime_drives_exact_lifecycle_and_persists_artifacts() {
+    let fixture = ControllerFixture::new();
+    let mut controller = fixture.create();
+    let catalog = ProfileCatalog::load(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/r1/profiles.toml"),
+    )
+    .unwrap();
+    let plan = RunPlan {
+        profile: ScaleProfile::MacSmoke,
+        spec: catalog.get(ScaleProfile::MacSmoke).unwrap().clone(),
+        mode: RunMode::Correctness,
+        engines: vec![EngineKind::Graydb, EngineKind::Clickhouse],
+        input_hashes: BTreeMap::from([("dataset".into(), "hash".into())]),
+    };
+    let mut runtime = LifecycleRuntime::default();
+    assert_eq!(
+        controller
+            .run_to_terminal(&plan, &mut runtime)
+            .await
+            .unwrap(),
+        LifecycleStatus::Complete
+    );
+    assert_eq!(runtime.stages, RunStage::ordered());
+    assert!(controller
+        .state()
+        .stages
+        .values()
+        .all(|record| !record.artifact_paths.is_empty()));
+}
+
+#[tokio::test]
+async fn isolated_mode_rejects_mismatched_replay_hashes_before_query_stages() {
+    let fixture = ControllerFixture::new();
+    let mut controller = fixture.create();
+    let catalog = ProfileCatalog::load(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/r1/profiles.toml"),
+    )
+    .unwrap();
+    let plan = RunPlan {
+        profile: ScaleProfile::MacSmoke,
+        spec: catalog.get(ScaleProfile::MacSmoke).unwrap().clone(),
+        mode: RunMode::Isolated,
+        engines: vec![EngineKind::Graydb, EngineKind::Clickhouse],
+        input_hashes: BTreeMap::new(),
+    };
+    let mut runtime = BadIsolatedRuntime(LifecycleRuntime::default());
+    assert!(controller
+        .run_to_terminal(&plan, &mut runtime)
+        .await
+        .is_err());
+    assert_eq!(
+        runtime.0.stages,
+        vec![
+            RunStage::Preflight,
+            RunStage::Seed,
+            RunStage::BaselineSnapshot
+        ]
+    );
+    assert_eq!(controller.next_stage(), Some(RunStage::BaselineSnapshot));
 }
 
 #[test]

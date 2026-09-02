@@ -40,3 +40,33 @@ fn invalidation_self_test_writes_no_benchmark_result() {
     assert!(output.status.success());
     assert!(!root.path().join("result.json").exists());
 }
+
+#[test]
+fn invalid_resume_generates_only_report_and_checksums_then_exits_nonzero() {
+    let root = tempdir().unwrap();
+    let mut controller = graydb_r1::RunController::create(root.path(), "invalid-cli").unwrap();
+    controller
+        .invalidate(graydb_r1::RunInvalidation::DatasetHashMismatch)
+        .unwrap();
+    drop(controller);
+    let output = Command::new(env!("CARGO_BIN_EXE_r1ctl"))
+        .args([
+            "resume",
+            "--run-root",
+            root.path().to_str().unwrap(),
+            "--run-id",
+            "invalid-cli",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let run = root.path().join("invalid-cli");
+    assert!(run.join("result.json").is_file());
+    assert!(run.join("result.md").is_file());
+    assert!(run.join("SHA256SUMS").is_file());
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run.join("run-state.json")).unwrap()).unwrap();
+    assert!(state["stages"].get("report").is_some());
+    assert!(state["stages"].get("checksums").is_some());
+    assert!(state["stages"].get("preflight").is_none());
+}

@@ -21,6 +21,170 @@ pub struct RowDifference {
     pub detail: String,
 }
 
+/// Production-callable proof fixtures used by `r1ctl self-test-invalidations`.
+/// They intentionally mirror Task 9's four corruptions and return an error if
+/// any candidate is accepted.  They do not write benchmark artifacts.
+pub mod mutation_fixtures {
+    use super::*;
+    use crate::workload::{OrderEventRow, OrderRow};
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum Mutation {
+        DropSequence,
+        DuplicateSequence,
+        UseVersionBeforeCheckpoint,
+        IgnoreLatestTombstone,
+    }
+
+    pub fn run_all() -> Result<Vec<Mutation>> {
+        let expected = fixture();
+        let mutations = [
+            Mutation::DropSequence,
+            Mutation::DuplicateSequence,
+            Mutation::UseVersionBeforeCheckpoint,
+            Mutation::IgnoreLatestTombstone,
+        ];
+        for mutation in mutations {
+            let candidate = mutated(&expected.1, mutation)?;
+            let verdict = expected.0.compare(&candidate);
+            ensure!(
+                !verdict.passed && !verdict.differences.is_empty(),
+                "Task 9 mutation fixture {mutation:?} was accepted"
+            );
+        }
+        Ok(mutations.to_vec())
+    }
+
+    fn fixture() -> (LedgerOracle, Vec<TransactionPlan>) {
+        let mut oracle = LedgerOracle::new();
+        oracle.load_tenant(1, "eu");
+        oracle.load_tenant(2, "us");
+        let plans = vec![
+            plan(1, order(100, 1, 10, "new", 1_000)),
+            plan(2, order(200, 2, 20, "paid", 2_000)),
+            plan(
+                3,
+                Operation::UpdateOrder {
+                    order_id: 100,
+                    tenant_id: 1,
+                    customer_id: 10,
+                    status: "paid".into(),
+                    channel: "app".into(),
+                    amount_cents: 1_500,
+                    created_at_micros: 1,
+                    updated_at_micros: 2,
+                    attributes_json: "{}".into(),
+                },
+            ),
+            plan(
+                4,
+                Operation::InsertOrderEvent(OrderEventRow {
+                    event_id: 300,
+                    order_id: 100,
+                    tenant_id: 1,
+                    event_type: "shipped".into(),
+                    event_at_micros: 3,
+                    metadata_json: "{}".into(),
+                }),
+            ),
+            plan(
+                5,
+                Operation::DeleteOrder {
+                    order_id: 200,
+                    tenant_id: 2,
+                },
+            ),
+        ];
+        for (index, plan) in plans.iter().enumerate() {
+            oracle.apply(plan, 100 + index as u64).unwrap();
+        }
+        (oracle, plans)
+    }
+
+    fn mutated(plans: &[TransactionPlan], mutation: Mutation) -> Result<LedgerOracle> {
+        let mut candidate = LedgerOracle::new();
+        candidate.load_tenant(1, "eu");
+        candidate.load_tenant(2, "us");
+        for (index, plan) in plans.iter().enumerate() {
+            let lsn = 100 + index as u64;
+            match mutation {
+                Mutation::DropSequence if plan.sequence == 3 => continue,
+                Mutation::DuplicateSequence if plan.sequence == 4 => {
+                    candidate.apply_unchecked(plan, lsn)?;
+                    candidate.apply_unchecked(plan, lsn)?;
+                }
+                Mutation::UseVersionBeforeCheckpoint if plan.sequence == 3 => {
+                    candidate.apply_unchecked(plan, lsn)?;
+                    let stale = candidate.order_history[&100][0].1.clone();
+                    candidate
+                        .order_history
+                        .get_mut(&100)
+                        .unwrap()
+                        .last_mut()
+                        .unwrap()
+                        .1 = stale;
+                }
+                Mutation::IgnoreLatestTombstone if plan.sequence == 5 => {
+                    // Keep the committed sequence but resurrect the deleted row.
+                    candidate.apply_unchecked(plan, lsn)?;
+                    let resurrected = OrderState {
+                        tenant_id: 2,
+                        customer_id: 20,
+                        status: "paid".into(),
+                        channel: "web".into(),
+                        amount_cents: 2_000,
+                        created_at_micros: 1,
+                        updated_at_micros: 1,
+                        attributes_json: "{}".into(),
+                        version: lsn,
+                    };
+                    candidate.orders.insert(200, resurrected.clone());
+                    candidate
+                        .order_history
+                        .get_mut(&200)
+                        .unwrap()
+                        .last_mut()
+                        .unwrap()
+                        .1 = Some(resurrected);
+                }
+                _ => candidate.apply_unchecked(plan, lsn)?,
+            }
+        }
+        Ok(candidate)
+    }
+
+    fn plan(sequence: u64, operation: Operation) -> TransactionPlan {
+        let operations = vec![operation];
+        let digest = Sha256::digest(serde_json::to_vec(&operations).unwrap());
+        TransactionPlan {
+            sequence,
+            logical_time_micros: sequence as i64,
+            operations,
+            operation_sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        }
+    }
+
+    fn order(
+        order_id: u64,
+        tenant_id: u64,
+        customer_id: u64,
+        status: &str,
+        amount_cents: i64,
+    ) -> Operation {
+        Operation::InsertOrder(OrderRow {
+            order_id,
+            tenant_id,
+            customer_id,
+            status: status.into(),
+            channel: "web".into(),
+            amount_cents,
+            created_at_micros: 1,
+            updated_at_micros: 1,
+            attributes_json: "{}".into(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrectnessVerdict {
     pub passed: bool,

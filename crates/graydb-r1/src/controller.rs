@@ -3,7 +3,7 @@
 //! the boundary so the state machine can be exercised without services.
 
 use crate::artifacts::{sha256_tree, Event, EventLevel, EventSink, RunDirectory};
-use crate::contracts::{EngineKind, ProfileSpec};
+use crate::contracts::{EngineKind, ProfileSpec, RunMode, ScaleProfile};
 use crate::verdict::RunInvalidation;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,8 @@ pub struct StageOutcome {
     pub artifact_paths: Vec<String>,
     pub valid: bool,
     pub invalidation: Option<RunInvalidation>,
+    #[serde(default)]
+    pub query_records: Vec<StageQueryRecord>,
 }
 
 impl Default for StageOutcome {
@@ -102,8 +104,62 @@ impl Default for StageOutcome {
             artifact_paths: Vec::new(),
             valid: true,
             invalidation: None,
+            query_records: Vec::new(),
         }
     }
+}
+
+/// Every timed query observation is retained at the controller boundary.  The
+/// runtime must supply the checkpoint/visibility pair instead of treating a
+/// query's wall-clock completion as a freshness proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageQueryRecord {
+    pub query: crate::query::QueryId,
+    pub started_at_unix_ms: u128,
+    pub target_lsn: u64,
+    pub visible_lsn: u64,
+    pub canonical_digest: String,
+    pub elapsed_ns: u128,
+    pub bytes_read: Option<u64>,
+    pub failed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunPlan {
+    pub profile: ScaleProfile,
+    pub spec: ProfileSpec,
+    pub mode: RunMode,
+    pub engines: Vec<EngineKind>,
+    pub input_hashes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StageContext<'a> {
+    pub stage: RunStage,
+    pub plan: &'a RunPlan,
+    pub policy: Option<QueryStagePolicy>,
+    pub run_root: &'a Path,
+    pub invalidations: Vec<RunInvalidation>,
+}
+
+#[async_trait::async_trait]
+pub trait BenchmarkRuntime: Send {
+    /// Performs one stage only.  The controller, not the runtime, owns durable
+    /// stage transitions, ordering, resume, and invalidation progression.
+    async fn execute_stage(&mut self, context: StageContext<'_>) -> Result<StageOutcome>;
+
+    async fn prepare_isolated_replay(
+        &mut self,
+        _context: StageContext<'_>,
+    ) -> Result<IsolatedReplayEvidence> {
+        bail!("isolated mode requires a runtime that binds committed ledger replay")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleStatus {
+    Complete,
+    InvalidArchived,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -270,7 +326,14 @@ impl RunController {
 
     pub fn complete_stage(&mut self, stage: RunStage, outcome: StageOutcome) -> Result<()> {
         self.assert_stage_allowed(stage)?;
-        let record = self.state.stages.entry(stage).or_default();
+        let record = self
+            .state
+            .stages
+            .get_mut(&stage)
+            .ok_or_else(|| anyhow::anyhow!("stage {stage:?} has no durable start record"))?;
+        if record.started_at_unix_ms.is_none() || record.completed {
+            bail!("stage {stage:?} is not a currently durable started stage");
+        }
         record.ended_at_unix_ms = Some(unix_ms());
         record.command_outcomes = outcome.command_outcomes;
         record.artifact_paths = outcome.artifact_paths;
@@ -317,6 +380,57 @@ impl RunController {
         }
     }
 
+    /// Runs the exact ordered stage list.  Runtime calls are deliberately made
+    /// only after `begin_stage` has synced state, and report/checksum stages
+    /// remain executable after invalidation while every benchmark stage is
+    /// refused by `assert_stage_allowed`.
+    pub async fn run_to_terminal<R: BenchmarkRuntime>(
+        &mut self,
+        plan: &RunPlan,
+        runtime: &mut R,
+    ) -> Result<LifecycleStatus> {
+        while let Some(stage) = self.next_stage() {
+            let hashes = plan.input_hashes.clone();
+            self.begin_stage(stage, hashes)?;
+            let outcome = {
+                let context = StageContext {
+                    stage,
+                    plan,
+                    policy: QueryStagePolicy::for_stage(&plan.spec, stage),
+                    run_root: self.run_root(),
+                    invalidations: self.state.invalidations.clone(),
+                };
+                let outcome = runtime.execute_stage(context.clone()).await?;
+                if stage == RunStage::BaselineSnapshot && plan.mode == RunMode::Isolated {
+                    runtime.prepare_isolated_replay(context).await?.validate()?;
+                }
+                outcome
+            };
+            if let Some(policy) = QueryStagePolicy::for_stage(&plan.spec, stage) {
+                let samples = query_sample_counts(&outcome.query_records);
+                if !policy.validates(&samples, policy.scheduled_duration) {
+                    self.complete_stage(
+                        stage,
+                        StageOutcome {
+                            valid: false,
+                            invalidation: Some(RunInvalidation::MissingArtifact(format!(
+                                "{stage:?} did not record at least 30 successful samples for Q1-Q5 within 2x duration"
+                            ))),
+                            ..outcome
+                        },
+                    )?;
+                    continue;
+                }
+            }
+            self.complete_stage(stage, outcome)?;
+        }
+        Ok(if self.state.is_invalid() {
+            LifecycleStatus::InvalidArchived
+        } else {
+            LifecycleStatus::Complete
+        })
+    }
+
     pub fn invalidate(&mut self, reason: RunInvalidation) -> Result<()> {
         self.state.invalidations.push(reason);
         self.persist()?;
@@ -348,6 +462,25 @@ impl RunController {
             message,
         ))
     }
+}
+
+fn query_sample_counts(records: &[StageQueryRecord]) -> Vec<u64> {
+    use crate::query::QueryId;
+    [
+        QueryId::Q1,
+        QueryId::Q2,
+        QueryId::Q3,
+        QueryId::Q4,
+        QueryId::Q5,
+    ]
+    .iter()
+    .map(|query| {
+        records
+            .iter()
+            .filter(|record| record.query == *query && !record.failed)
+            .count() as u64
+    })
+    .collect()
 }
 
 fn persist_state(root: &Path, state: &RunState) -> Result<()> {
@@ -476,6 +609,101 @@ pub fn validate_workload_hashes(expected: &[String], replayed: &[Vec<String>]) -
         bail!("isolated replay workload hashes do not match the canonical intent plan");
     }
     Ok(())
+}
+
+/// Durable isolated replay evidence.  The coordinator builds these entries from
+/// the committed ledger through `WorkloadReplayer`; validation happens before a
+/// query stage is allowed to start.
+#[derive(Debug, Clone)]
+pub struct IsolatedReplayEvidence {
+    pub workload_hashes: Vec<Vec<String>>,
+    pub replay_maps: Vec<Vec<crate::replication::ReplayMapEntry>>,
+    pub logical_checkpoints: Vec<u64>,
+}
+
+impl IsolatedReplayEvidence {
+    pub fn validate(&self) -> Result<()> {
+        let expected = self
+            .workload_hashes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("isolated replay has no workload hash"))?;
+        validate_workload_hashes(expected, &self.workload_hashes)?;
+        if self.replay_maps.len() != 2 || self.logical_checkpoints.len() != 2 {
+            bail!("isolated mode requires exactly two replay maps and matching checkpoints");
+        }
+        if self.logical_checkpoints[0] != self.logical_checkpoints[1] {
+            bail!("isolated engines did not reach the same logical checkpoint");
+        }
+        let first = &self.replay_maps[0];
+        for map in &self.replay_maps[1..] {
+            if first.len() != map.len()
+                || first.iter().zip(map).any(|(a, b)| {
+                    a.logical_sequence != b.logical_sequence
+                        || a.original_source_lsn != b.original_source_lsn
+                        || a.operation_sha256 != b.operation_sha256
+                })
+            {
+                bail!("isolated replay maps do not represent the same committed ledger");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Restores the immutable baseline separately for both engines and writes each
+/// sequence-to-LSN map through Task 8's `WorkloadReplayer`.  The caller supplies
+/// only committed plans/ledger entries; uncommitted intent cannot enter replay.
+pub fn build_isolated_replays(
+    snapshot: &BaselineSnapshot,
+    run_root: &Path,
+    replays: &[(
+        EngineKind,
+        Vec<(
+            crate::workload::TransactionPlan,
+            crate::ledger::LedgerEntry,
+            u64,
+        )>,
+    )],
+) -> Result<IsolatedReplayEvidence> {
+    if replays.len() != 2 {
+        bail!("isolated mode requires exactly GrayDB and ClickHouse replays");
+    }
+    let mut workload_hashes = Vec::new();
+    let mut replay_maps = Vec::new();
+    let mut logical_checkpoints = Vec::new();
+    for (engine, entries) in replays {
+        snapshot.restore_isolated(run_root, *engine)?;
+        let engine_name = match engine {
+            EngineKind::Graydb => "graydb",
+            EngineKind::Clickhouse => "clickhouse",
+        };
+        let map_dir = run_root.join("isolated").join(engine_name);
+        let mut replayer = crate::replication::WorkloadReplayer::new(
+            crate::replication::ReplayMap::create(&map_dir)?,
+        );
+        replayer.replay(entries)?;
+        let map = replayer.into_replay_map();
+        workload_hashes.push(
+            entries
+                .iter()
+                .map(|(plan, _, _)| plan.operation_sha256.clone())
+                .collect(),
+        );
+        logical_checkpoints.push(
+            map.entries()
+                .last()
+                .map(|entry| entry.logical_sequence)
+                .unwrap_or(0),
+        );
+        replay_maps.push(map.entries().to_vec());
+    }
+    let evidence = IsolatedReplayEvidence {
+        workload_hashes,
+        replay_maps,
+        logical_checkpoints,
+    };
+    evidence.validate()?;
+    Ok(evidence)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,5 +848,114 @@ mod tests {
         assert!(snapshot
             .restore_isolated(root.path(), EngineKind::Graydb)
             .is_err());
+    }
+
+    #[test]
+    fn stop_rules_cover_freshness_backlog_correctness_and_free_space() {
+        let base = RateSearchObservation {
+            target_rows_per_sec: 1_000,
+            achieved_rows_per_sec: 1_000,
+            freshness_p99_ms: 1,
+            backlog_bytes: 0,
+            backlog_growing: false,
+            correctness_passed: true,
+            resource_gate: None,
+        };
+        let mut freshness = base.clone();
+        freshness.freshness_p99_ms = 1_001;
+        assert!(matches!(
+            rate_search_stop(&[freshness]),
+            Some(RunInvalidation::FreshnessP99Exceeded { .. })
+        ));
+        let mut incorrect = base.clone();
+        incorrect.correctness_passed = false;
+        assert!(matches!(
+            rate_search_stop(&[incorrect]),
+            Some(RunInvalidation::ResultDigestMismatch { .. })
+        ));
+        let mut backlog = base;
+        backlog.backlog_bytes = BACKLOG_LIMIT_BYTES + 1;
+        backlog.backlog_growing = true;
+        assert!(matches!(
+            rate_search_stop(&[backlog.clone(), backlog.clone(), backlog]),
+            Some(RunInvalidation::ResourceSafetyGate(_))
+        ));
+        assert!(pause_for_free_space(100, 14));
+        assert!(!pause_for_free_space(100, 15));
+    }
+
+    #[test]
+    fn isolated_replay_coordinator_writes_two_maps_and_rejects_hash_mismatch() {
+        use crate::ledger::LedgerEntry;
+        use crate::workload::WorkloadPlanner;
+        let root = tempdir().unwrap();
+        let baseline = root.path().join("baseline/postgres");
+        fs::create_dir_all(&baseline).unwrap();
+        fs::write(baseline.join("PG_VERSION"), "17").unwrap();
+        let snapshot = BaselineSnapshot {
+            postgres_dir: baseline,
+            checksum_path: root.path().join("unused"),
+        };
+        let plan = WorkloadPlanner::new(20260901).plan(1);
+        let entry = LedgerEntry {
+            sequence: 1,
+            xid: 1,
+            source_lsn: 100,
+            operation_sha256: plan.operation_sha256.clone(),
+            committed_unix_ms: 0,
+            previous_entry_sha256: String::new(),
+            entry_sha256: String::new(),
+        };
+        let good = vec![(plan.clone(), entry.clone(), 200)];
+        let evidence = build_isolated_replays(
+            &snapshot,
+            root.path(),
+            &[
+                (EngineKind::Graydb, good.clone()),
+                (EngineKind::Clickhouse, good),
+            ],
+        )
+        .unwrap();
+        assert_eq!(evidence.replay_maps.len(), 2);
+        assert!(root
+            .path()
+            .join("isolated/graydb/replay-map.jsonl")
+            .is_file());
+        let bad_root = tempdir().unwrap();
+        let bad_baseline = bad_root.path().join("baseline/postgres");
+        fs::create_dir_all(&bad_baseline).unwrap();
+        fs::write(bad_baseline.join("PG_VERSION"), "17").unwrap();
+        let bad_snapshot = BaselineSnapshot {
+            postgres_dir: bad_baseline,
+            checksum_path: bad_root.path().join("unused"),
+        };
+        let bad = LedgerEntry {
+            operation_sha256: "bad".into(),
+            ..entry
+        };
+        assert!(build_isolated_replays(
+            &bad_snapshot,
+            bad_root.path(),
+            &[
+                (EngineKind::Graydb, vec![(plan.clone(), bad, 200)]),
+                (
+                    EngineKind::Clickhouse,
+                    vec![(
+                        plan.clone(),
+                        LedgerEntry {
+                            sequence: 1,
+                            xid: 1,
+                            source_lsn: 100,
+                            operation_sha256: plan.operation_sha256.clone(),
+                            committed_unix_ms: 0,
+                            previous_entry_sha256: String::new(),
+                            entry_sha256: String::new()
+                        },
+                        200
+                    )]
+                )
+            ]
+        )
+        .is_err());
     }
 }

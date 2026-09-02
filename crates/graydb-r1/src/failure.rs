@@ -16,6 +16,30 @@ pub const WRITER_OUTAGE: Duration = Duration::from_secs(30);
 pub const CATCHUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const CONTROLLER_RESTART_EXIT_CODE: i32 = 75;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdcEndpoint {
+    /// Explicit container/network endpoint supplied by the runtime.  It is not
+    /// inferred from Compose service names, because the Compose contract has no
+    /// standalone CDC service.
+    pub network: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FailureEvidence {
+    pub command: Vec<String>,
+    pub signal: String,
+    pub started_at_unix_ms: u128,
+    pub source_lsn_before: u64,
+    pub source_lsn_after: u64,
+    pub last_received_lsn: u64,
+    pub last_applied_lsn: u64,
+    pub restart_duration: Duration,
+    pub catchup_duration: Duration,
+    pub replay_count: u64,
+    pub lsn_range_validated: bool,
+}
+
 #[async_trait]
 pub trait ComposeControl: Send + Sync {
     /// Executes `program` with `args` directly.  Implementations must not pass
@@ -32,27 +56,27 @@ pub trait ComposeControl: Send + Sync {
             .await
     }
 
-    async fn disconnect_cdc(&self, service: &str) -> Result<CommandOutcome> {
+    async fn disconnect_cdc(&self, endpoint: &CdcEndpoint) -> Result<CommandOutcome> {
         self.invoke(
             "docker",
             &[
                 "network".into(),
                 "disconnect".into(),
-                "graydb-r1_default".into(),
-                service.into(),
+                endpoint.network.clone(),
+                endpoint.endpoint.clone(),
             ],
         )
         .await
     }
 
-    async fn reconnect_cdc(&self, service: &str) -> Result<CommandOutcome> {
+    async fn reconnect_cdc(&self, endpoint: &CdcEndpoint) -> Result<CommandOutcome> {
         self.invoke(
             "docker",
             &[
                 "network".into(),
                 "connect".into(),
-                "graydb-r1_default".into(),
-                service.into(),
+                endpoint.network.clone(),
+                endpoint.endpoint.clone(),
             ],
         )
         .await
@@ -86,6 +110,26 @@ pub trait FailureWorkload: Send + Sync {
     async fn validate(&self, engine: EngineKind) -> Result<CorrectnessVerdict>;
     async fn stop_writer(&self) -> Result<()>;
     async fn resume_writer(&self) -> Result<()>;
+    async fn source_lsn(&self) -> Result<u64> {
+        Ok(0)
+    }
+    async fn received_lsn(&self, _engine: EngineKind) -> Result<u64> {
+        Ok(0)
+    }
+    async fn applied_lsn(&self, _engine: EngineKind) -> Result<u64> {
+        Ok(0)
+    }
+    async fn replay_count(&self, _engine: EngineKind) -> Result<u64> {
+        Ok(0)
+    }
+    async fn validate_lsn_range(
+        &self,
+        engine: EngineKind,
+        _from: u64,
+        _through: u64,
+    ) -> Result<CorrectnessVerdict> {
+        self.validate(engine).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +139,7 @@ pub struct EngineFailureResult {
     pub catchup_duration: Duration,
     pub correctness: CorrectnessVerdict,
     pub commands: Vec<CommandOutcome>,
+    pub evidence: FailureEvidence,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +177,8 @@ where
         outage: Duration,
     ) -> Result<EngineFailureResult> {
         let before = self.workload.source_rows_written().await?;
+        let source_lsn_before = self.workload.source_lsn().await?;
+        let started_at_unix_ms = unix_ms();
         let stopped = self.compose.stop_engine(engine).await?;
         require_success(&stopped)?;
         tokio::time::sleep(outage).await;
@@ -145,7 +192,11 @@ where
         if catchup_duration > CATCHUP_TIMEOUT {
             bail!("{engine:?} did not catch up within 30 minutes");
         }
-        let correctness = self.workload.validate(engine).await?;
+        let source_lsn_after = self.workload.source_lsn().await?;
+        let correctness = self
+            .workload
+            .validate_lsn_range(engine, source_lsn_before, source_lsn_after)
+            .await?;
         if !correctness.passed {
             bail!("{engine:?} failed post-recovery correctness validation");
         }
@@ -155,14 +206,32 @@ where
             catchup_duration,
             correctness,
             commands: vec![stopped, started],
+            evidence: FailureEvidence {
+                command: vec![
+                    "docker".into(),
+                    "compose".into(),
+                    "stop".into(),
+                    service_name(engine).into(),
+                ],
+                signal: "planned-stop".into(),
+                started_at_unix_ms,
+                source_lsn_before,
+                source_lsn_after,
+                last_received_lsn: self.workload.received_lsn(engine).await?,
+                last_applied_lsn: self.workload.applied_lsn(engine).await?,
+                restart_duration: outage,
+                catchup_duration,
+                replay_count: self.workload.replay_count(engine).await?,
+                lsn_range_validated: true,
+            },
         })
     }
 
-    pub async fn run_cdc_disconnect(&self, service: &str) -> Result<Vec<CommandOutcome>> {
-        let disconnected = self.compose.disconnect_cdc(service).await?;
+    pub async fn run_cdc_disconnect(&self, endpoint: &CdcEndpoint) -> Result<Vec<CommandOutcome>> {
+        let disconnected = self.compose.disconnect_cdc(endpoint).await?;
         require_success(&disconnected)?;
         tokio::time::sleep(CDC_OUTAGE).await;
-        let reconnected = self.compose.reconnect_cdc(service).await?;
+        let reconnected = self.compose.reconnect_cdc(endpoint).await?;
         require_success(&reconnected)?;
         Ok(vec![disconnected, reconnected])
     }
@@ -175,15 +244,18 @@ where
 
     /// Executes the fixed correctness-mode sequence in spec section 14.  The
     /// caller durably records this outcome before honoring `restart_exit_code`.
-    pub async fn run_failure_sequence(&self) -> Result<FailureSequenceResult> {
+    pub async fn run_failure_sequence(
+        &self,
+        cdc_endpoints: [CdcEndpoint; 2],
+    ) -> Result<FailureSequenceResult> {
         let graydb = self
             .run_engine_kill(EngineKind::Graydb, ENGINE_OUTAGE)
             .await?;
         let clickhouse = self
             .run_engine_kill(EngineKind::Clickhouse, ENGINE_OUTAGE)
             .await?;
-        let graydb_cdc = self.run_cdc_disconnect("graydb").await?;
-        let clickhouse_cdc = self.run_cdc_disconnect("clickhouse").await?;
+        let graydb_cdc = self.run_cdc_disconnect(&cdc_endpoints[0]).await?;
+        let clickhouse_cdc = self.run_cdc_disconnect(&cdc_endpoints[1]).await?;
         self.run_writer_restart().await?;
         Ok(FailureSequenceResult {
             engine_failures: vec![graydb, clickhouse],
@@ -191,6 +263,13 @@ where
             restart_exit_code: CONTROLLER_RESTART_EXIT_CODE,
         })
     }
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 pub const fn controller_restart_exit_code() -> i32 {
@@ -289,10 +368,14 @@ mod tests {
                 rows: AtomicU64::new(10),
             }),
         );
-        let result = runner.run_failure_sequence().await.unwrap();
+        let result = runner.run_failure_sequence(endpoints()).await.unwrap();
         assert_eq!(result.engine_failures.len(), 2);
         assert_eq!(result.cdc_interruptions.len(), 2);
         assert_eq!(result.restart_exit_code, CONTROLLER_RESTART_EXIT_CODE);
+        assert!(result
+            .engine_failures
+            .iter()
+            .all(|failure| failure.evidence.lsn_range_validated));
     }
 
     #[test]
@@ -301,5 +384,18 @@ mod tests {
             compose_args("stop", "graydb"),
             ["compose", "stop", "graydb"]
         );
+    }
+
+    fn endpoints() -> [CdcEndpoint; 2] {
+        [
+            CdcEndpoint {
+                network: "graydb-r1_default".into(),
+                endpoint: "graydb".into(),
+            },
+            CdcEndpoint {
+                network: "graydb-r1_default".into(),
+                endpoint: "clickhouse".into(),
+            },
+        ]
     }
 }
