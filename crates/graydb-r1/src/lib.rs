@@ -2,6 +2,8 @@ pub mod adapter;
 pub mod artifacts;
 pub mod clickhouse;
 pub mod contracts;
+pub mod controller;
+pub mod failure;
 pub mod generator;
 pub mod graydb;
 pub mod ledger;
@@ -23,6 +25,16 @@ pub use clickhouse::{
 };
 pub use contracts::{
     EngineKind, LogicalCheckpoint, ProfileCatalog, ProfileSpec, RunConfig, RunMode, ScaleProfile,
+};
+pub use controller::{
+    free_space_sample_interval, pause_for_free_space, rate_search_stop, validate_workload_hashes,
+    BaselineSnapshot, CommandOutcome, ProcessRunner, QueryStagePolicy, RateSearchObservation,
+    RunController, RunStage, RunState, StageOutcome, StageRecord, SystemProcessRunner,
+};
+pub use failure::{
+    controller_restart_exit_code, ComposeControl, EngineFailureResult, FailureRunner,
+    FailureSequenceResult, FailureWorkload, SystemComposeControl, CATCHUP_TIMEOUT, CDC_OUTAGE,
+    CONTROLLER_RESTART_EXIT_CODE, ENGINE_OUTAGE, WRITER_OUTAGE,
 };
 pub use generator::{CopyBatch, DeterministicGenerator, Row, Table};
 pub use graydb::GrayDbAdapter;
