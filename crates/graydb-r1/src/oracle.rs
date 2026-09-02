@@ -3,6 +3,7 @@
 //! stale version, or ignored tombstone must fail `compare`.
 
 use crate::query::{canonical_digest, render_sql, QueryId, QueryParameters};
+use crate::verdict::RunInvalidation;
 use crate::workload::{Operation, TransactionPlan};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ pub struct RowDifference {
 pub struct CorrectnessVerdict {
     pub passed: bool,
     pub differences: Vec<RowDifference>,
+    pub invalidations: Vec<RunInvalidation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,6 +594,16 @@ impl LedgerOracle {
         }
     }
 
+    /// Public Task 9 interface alias for exact checkpoint queries.
+    pub fn query(
+        &self,
+        id: QueryId,
+        params: &QueryParameters,
+        target_lsn: u64,
+    ) -> crate::query::QueryResult {
+        self.query_at(id, params, target_lsn)
+    }
+
     /// Compares this expected state against a candidate at the latest recorded
     /// checkpoint. Sequence gaps and duplicates are differences, not errors.
     pub fn compare(&self, candidate: &LedgerOracle) -> CorrectnessVerdict {
@@ -629,7 +641,18 @@ impl LedgerOracle {
                         detail: format!("sequence {sequence} hash mismatch"),
                     });
                 }
-                _ => {}
+                _ => {
+                    let expected_lsn = self.sequence_lsn.get(sequence).copied().unwrap_or(0);
+                    let actual_lsn = candidate.sequence_lsn.get(sequence).copied().unwrap_or(0);
+                    if expected_lsn != actual_lsn {
+                        let after = self
+                            .sequence_lsn
+                            .iter()
+                            .find_map(|(other, lsn)| (*lsn == actual_lsn).then_some(*other))
+                            .unwrap_or(*sequence);
+                        differences.push(RowDifference { table: SEQUENCE_TABLE.into(), primary_key: *sequence, expected_version: *sequence, actual_version: after, target_checkpoint: target, detail: format!("state-changing reorder: sequence {sequence} expected LSN {expected_lsn}, candidate LSN {actual_lsn}") });
+                    }
+                }
             }
         }
         for sequence in candidate
@@ -665,9 +688,11 @@ impl LedgerOracle {
         self.compare_customers(candidate, target, &mut differences);
         self.compare_events(candidate, target, &mut differences);
 
+        let invalidations = invalidations_for(&differences);
         CorrectnessVerdict {
             passed: differences.is_empty(),
             differences,
+            invalidations,
         }
     }
 
@@ -921,6 +946,19 @@ impl PostgresCheckpoint {
                 source_lsn: captured.source_lsn,
             };
             let mut differences = Vec::new();
+            let ledger_digests = ledger_query_digests(oracle, params, captured.source_lsn);
+            for (name, id) in QUERIES {
+                if captured.query_digests.get(name) != ledger_digests.get(name) {
+                    differences.push(RowDifference {
+                        table: "postgres".into(),
+                        primary_key: id as u64,
+                        expected_version: captured.source_lsn,
+                        actual_version: captured.source_lsn,
+                        target_checkpoint: captured.source_lsn,
+                        detail: format!("{name} PostgreSQL digest disagrees with ledger oracle"),
+                    });
+                }
+            }
             compare_samples(
                 &expected_samples,
                 &captured.samples,
@@ -969,6 +1007,16 @@ impl PostgresCheckpoint {
                             detail: format!("{name} canonical digest mismatch"),
                         });
                     }
+                    if ledger_digests.get(name) != Some(&digest) {
+                        differences.push(RowDifference {
+                            table: format!("engine:{}", engine.name()),
+                            primary_key: id as u64,
+                            expected_version: captured.source_lsn,
+                            actual_version: result.visible_lsn,
+                            target_checkpoint: captured.source_lsn,
+                            detail: format!("{name} digest disagrees with ledger oracle"),
+                        });
+                    }
                     query_digests.insert(name.to_string(), digest);
                 }
                 let samples = engine
@@ -992,6 +1040,7 @@ impl PostgresCheckpoint {
                 engines: evidence,
                 verdict: CorrectnessVerdict {
                     passed: differences.is_empty(),
+                    invalidations: invalidations_for(&differences),
                     differences,
                 },
             };
@@ -1090,6 +1139,65 @@ impl PostgresCheckpoint {
             samples,
         })
     }
+}
+
+fn ledger_query_digests(
+    oracle: &LedgerOracle,
+    params: &QueryParameters,
+    target_lsn: u64,
+) -> BTreeMap<String, String> {
+    QUERIES
+        .into_iter()
+        .map(|(name, id)| {
+            (
+                name.to_string(),
+                canonical_digest(&oracle.query(id, params, target_lsn)),
+            )
+        })
+        .collect()
+}
+
+fn invalidations_for(differences: &[RowDifference]) -> Vec<RunInvalidation> {
+    let mut out = Vec::new();
+    for difference in differences {
+        let detail = difference.detail.as_str();
+        let reason = if detail.contains("missing committed sequence") {
+            Some(RunInvalidation::MissingSequence(difference.primary_key))
+        } else if detail.contains("multiple times") || detail.contains("duplicate") {
+            Some(RunInvalidation::DuplicateSequence(difference.primary_key))
+        } else if detail.contains("hash mismatch") {
+            Some(RunInvalidation::WorkloadHashMismatch)
+        } else if detail.contains("reorder") {
+            Some(RunInvalidation::StateChangingReorder {
+                before: difference.expected_version,
+                after: difference.actual_version,
+            })
+        } else if detail.contains("stale or mismatched LSN") {
+            Some(RunInvalidation::StaleResult {
+                target_lsn: difference.expected_version,
+                visible_lsn: difference.actual_version,
+            })
+        } else if detail.contains("digest") {
+            Some(RunInvalidation::ResultDigestMismatch {
+                query: match difference.primary_key {
+                    0 => QueryId::Q1,
+                    1 => QueryId::Q2,
+                    2 => QueryId::Q3,
+                    3 => QueryId::Q4,
+                    _ => QueryId::Q5,
+                },
+                checkpoint: difference.target_checkpoint,
+            })
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if !out.contains(&reason) {
+                out.push(reason);
+            }
+        }
+    }
+    out
 }
 
 fn postgres_cell_text(row: &tokio_postgres::Row, index: usize) -> Result<Option<String>> {
@@ -1712,6 +1820,51 @@ mod tests {
             .differences
             .iter()
             .any(|difference| difference.table == "r1.customers"));
+    }
+
+    #[test]
+    fn compare_at_rejects_disjoint_row_lsn_reorder_with_typed_invalidation() {
+        let fixture = OracleFixture::five_commits();
+        let mut candidate = fixture.mutated(Mutation::DuplicateSequence(99));
+        candidate.sequence_lsn.insert(1, 101);
+        candidate.sequence_lsn.insert(2, 100);
+        let verdict = fixture.oracle.compare_at(&candidate, 104);
+        assert!(!verdict.passed);
+        assert!(verdict.invalidations.iter().any(|reason| matches!(
+            reason,
+            RunInvalidation::StateChangingReorder {
+                before: 1,
+                after: 2
+            }
+        )));
+    }
+
+    #[test]
+    fn ledger_digest_mismatch_maps_to_a_durable_digest_invalidation() {
+        let fixture = OracleFixture::five_commits();
+        let params = QueryParameters {
+            window_end_micros: BASE_MICROS + 7 * DAY_MICROS,
+            tenant_id: 1,
+            tenant_set: vec![1, 2],
+        };
+        let digests =
+            ledger_query_digests(&fixture.oracle, &params, fixture.oracle.latest_checkpoint());
+        let difference = RowDifference {
+            table: "postgres".into(),
+            primary_key: QueryId::Q1 as u64,
+            expected_version: 104,
+            actual_version: 104,
+            target_checkpoint: 104,
+            detail: "q1 PostgreSQL digest disagrees with ledger oracle".into(),
+        };
+        assert_ne!(digests["q1"], "deliberately-wrong");
+        assert_eq!(
+            invalidations_for(&[difference]),
+            vec![RunInvalidation::ResultDigestMismatch {
+                query: QueryId::Q1,
+                checkpoint: 104
+            }]
+        );
     }
 
     struct RecordingWriter {

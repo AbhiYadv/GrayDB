@@ -2,7 +2,6 @@
 //! voids every performance number in the run; invalid runs never carry winner
 //! language into reports.
 
-use crate::contracts::ScaleProfile;
 use crate::query::QueryId;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -187,26 +186,6 @@ impl Scorecard {
     }
 }
 
-/// Minimal result shape shared by report tests and the report writer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VerdictFixtureResult {
-    pub benchmark_id: String,
-    pub profile: ScaleProfile,
-    pub valid: bool,
-    pub invalidations: Vec<RunInvalidation>,
-}
-
-/// A complete but invalid `R1-P1-v1` MacSmoke result carrying exactly one
-/// supplied invalidation. Reports must suppress winner language for it.
-pub fn invalid_result(reason: RunInvalidation) -> VerdictFixtureResult {
-    VerdictFixtureResult {
-        benchmark_id: "R1-P1-v1".into(),
-        profile: ScaleProfile::MacSmoke,
-        valid: false,
-        invalidations: vec![reason],
-    }
-}
-
 // --- Compose contract parsing (used by the Task 11 compose_contract test) ---
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,17 +352,6 @@ mod tests {
         assert_eq!(
             evaluate_cell(950, 1050, 1000, 1000),
             CellVerdict::ConflictingTail
-        );
-    }
-
-    #[test]
-    fn invalid_result_carries_the_reason_and_never_validity() {
-        let result = invalid_result(RunInvalidation::MissingSequence(9));
-        assert_eq!(result.benchmark_id, "R1-P1-v1");
-        assert!(!result.valid);
-        assert_eq!(
-            result.invalidations,
-            vec![RunInvalidation::MissingSequence(9)]
         );
     }
 
