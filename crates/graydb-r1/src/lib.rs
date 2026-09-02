@@ -6,9 +6,11 @@ pub mod generator;
 pub mod graydb;
 pub mod ledger;
 pub mod manifest;
+pub mod oracle;
 pub mod preflight;
 pub mod query;
 pub mod replication;
+pub mod verdict;
 pub mod workload;
 
 pub use adapter::{EngineAdapter, EngineStatus, QueryInvocation, QueryResult};
@@ -28,6 +30,11 @@ pub use manifest::{
     PostgresCopySink, PostgresPublishedSizeProbe, PublishedSizeProbe, TableManifest,
     PUBLISHED_TABLE_BYTES_SQL,
 };
+pub use oracle::{
+    CapturedCheckpoint, CheckpointVerdictSink, CorrectnessVerdict, EngineCheckpointEvidence,
+    LedgerOracle, PostgresCheckpoint, RowDifference, RowSample, SampledCheckpointEngine,
+    VerifiedCheckpoint, WriterControl,
+};
 pub use preflight::{
     PreflightFailure, PreflightPolicy, PreflightProbe, PreflightReport, PreflightSnapshot,
     SnapshotPreflightProbe, SystemPreflightProbe,
@@ -37,6 +44,7 @@ pub use replication::{
     ApplicationWriter, ControlLsnMapper, ControlReplicationConfig, LedgerCommit, ReplayMap,
     ReplayMapEntry, WorkloadReplayer,
 };
+pub use verdict::{CellVerdict, RunInvalidation, Scorecard, WinnerEvaluation};
 pub use workload::{
     CustomerRow, Operation, OrderEventRow, OrderRow, RateInterval, RateLimiter, RowMix,
     TransactionPlan, WorkloadPlanner,
