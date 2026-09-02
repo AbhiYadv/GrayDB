@@ -95,6 +95,11 @@ pub struct StageOutcome {
     pub invalidation: Option<RunInvalidation>,
     #[serde(default)]
     pub query_records: Vec<StageQueryRecord>,
+    /// The failure sequence uses this durable hand-off to ask the CLI process to
+    /// exit with code 75 after the stage record has been fsync'd.  A resumed
+    /// controller therefore starts at `FinalCheckpoint`, never inside a fault.
+    #[serde(default)]
+    pub controller_restart_required: bool,
 }
 
 impl Default for StageOutcome {
@@ -105,6 +110,7 @@ impl Default for StageOutcome {
             valid: true,
             invalidation: None,
             query_records: Vec::new(),
+            controller_restart_required: false,
         }
     }
 }
@@ -115,13 +121,27 @@ impl Default for StageOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageQueryRecord {
     pub query: crate::query::QueryId,
+    #[serde(default)]
+    pub engine: Option<EngineKind>,
+    /// Present for CDC/rate-search samples so the 30-success floor is enforced
+    /// independently for every attempted writer rate.
+    #[serde(default)]
+    pub target_rows_per_sec: Option<u64>,
+    #[serde(default)]
+    pub logical_checkpoint: u64,
     pub started_at_unix_ms: u128,
+    #[serde(default)]
+    pub completed_at_unix_ms: Option<u128>,
     pub target_lsn: u64,
     pub visible_lsn: u64,
     pub canonical_digest: String,
     pub elapsed_ns: u128,
+    #[serde(default)]
+    pub rows_read: Option<u64>,
     pub bytes_read: Option<u64>,
     pub failed: bool,
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +180,7 @@ pub trait BenchmarkRuntime: Send {
 pub enum LifecycleStatus {
     Complete,
     InvalidArchived,
+    RestartRequired,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +193,8 @@ pub struct StageRecord {
     pub valid: bool,
     pub completed: bool,
     pub execution_count: u32,
+    #[serde(default)]
+    pub query_records: Vec<StageQueryRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,10 +306,7 @@ impl RunController {
 
     pub fn set_plan(&mut self, plan: RunPlan) -> Result<()> {
         if let Some(existing) = &self.state.plan {
-            if existing.profile != plan.profile
-                || existing.mode != plan.mode
-                || existing.engines != plan.engines
-            {
+            if serde_json::to_value(existing)? != serde_json::to_value(&plan)? {
                 bail!("run plan is immutable once persisted");
             }
         }
@@ -341,6 +361,7 @@ impl RunController {
         record.ended_at_unix_ms = None;
         record.command_outcomes.clear();
         record.artifact_paths.clear();
+        record.query_records.clear();
         record.valid = true;
         record.completed = false;
         self.persist()?;
@@ -360,6 +381,7 @@ impl RunController {
         record.ended_at_unix_ms = Some(unix_ms());
         record.command_outcomes = outcome.command_outcomes;
         record.artifact_paths = outcome.artifact_paths;
+        record.query_records = outcome.query_records;
         record.valid = outcome.valid;
         record.completed = true;
         record.execution_count = record.execution_count.saturating_add(1);
@@ -409,9 +431,16 @@ impl RunController {
     /// refused by `assert_stage_allowed`.
     pub async fn run_to_terminal<R: BenchmarkRuntime>(
         &mut self,
-        plan: &RunPlan,
         runtime: &mut R,
     ) -> Result<LifecycleStatus> {
+        let plan = match self.state.plan.clone() {
+            Some(plan) => plan,
+            // Runs created before plan persistence have no frozen
+            // configuration and no default may be invented.  They can never
+            // execute benchmark stages again; invalidate with an exact reason
+            // and archive through report/checksums only.
+            None => return self.archive_unplanned().await,
+        };
         while let Some(stage) = self.next_stage() {
             let hashes = plan.input_hashes.clone();
             self.begin_stage(stage, hashes)?;
@@ -419,19 +448,35 @@ impl RunController {
             let outcome = {
                 let context = StageContext {
                     stage,
-                    plan,
-                    policy: QueryStagePolicy::for_stage(&plan.spec, stage),
+                    plan: &plan,
+                    policy: stage_policy(&plan, stage),
                     run_root: self.run_root(),
                     invalidations: self.state.invalidations.clone(),
                 };
-                let outcome = runtime.execute_stage(context.clone()).await?;
+                let outcome = match runtime.execute_stage(context.clone()).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.invalidate(RunInvalidation::UnexpectedProcessExit(format!(
+                            "{stage:?}: {error:#}"
+                        )))?;
+                        return Err(error);
+                    }
+                };
                 if stage == RunStage::BaselineSnapshot && plan.mode == RunMode::Isolated {
-                    runtime.prepare_isolated_replay(context).await?.validate()?;
+                    if let Err(error) = async {
+                        let evidence = runtime.prepare_isolated_replay(context).await?;
+                        evidence.validate()
+                    }
+                    .await
+                    {
+                        self.invalidate(RunInvalidation::WorkloadHashMismatch)?;
+                        return Err(error.context("preparing isolated replay"));
+                    }
                 }
                 outcome
             };
-            if let Some(policy) = QueryStagePolicy::for_stage(&plan.spec, stage) {
-                let samples = query_sample_counts(&outcome.query_records);
+            if let Some(policy) = stage_policy(&plan, stage) {
+                let samples = query_sample_counts(&outcome.query_records, &plan.engines);
                 if !policy.validates(&samples, started.elapsed()) {
                     self.complete_stage(
                         stage,
@@ -446,13 +491,69 @@ impl RunController {
                     continue;
                 }
             }
+            let restart_required = outcome.controller_restart_required;
             self.complete_stage(stage, outcome)?;
+            if restart_required {
+                return Ok(LifecycleStatus::RestartRequired);
+            }
         }
         Ok(if self.state.is_invalid() {
             LifecycleStatus::InvalidArchived
         } else {
             LifecycleStatus::Complete
         })
+    }
+
+    /// Archives a legacy run whose durable state has no persisted plan.  The
+    /// run is invalidated with an exact reason; only the report/checksum
+    /// stages execute, directly and without inventing any configuration.
+    async fn archive_unplanned(&mut self) -> Result<LifecycleStatus> {
+        if !self.state.is_invalid() {
+            self.invalidate(RunInvalidation::MissingArtifact(
+                "persisted run plan is missing; benchmark stages cannot execute".into(),
+            ))?;
+        }
+        while let Some(stage) = self.next_stage() {
+            self.begin_stage(stage, BTreeMap::new())?;
+            let outcome = match stage {
+                RunStage::Report => {
+                    let reason = self
+                        .state
+                        .invalidations
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            RunInvalidation::MissingArtifact("run plan is missing".into())
+                        });
+                    let mut result = crate::report::RunResult::invalid(reason);
+                    // A planless legacy run has no known profile; recording
+                    // one would invent configuration that never existed.
+                    result.profile = None;
+                    for extra in self.state.invalidations.iter().skip(1) {
+                        result.invalidations.push(extra.clone());
+                    }
+                    crate::report::ReportWriter::write(self.run_root(), &result)?;
+                    StageOutcome {
+                        artifact_paths: vec![
+                            "result.json".into(),
+                            "result.md".into(),
+                            "aws-capacity-request.json".into(),
+                        ],
+                        ..Default::default()
+                    }
+                }
+                RunStage::Checksums => {
+                    crate::artifacts::sha256_tree(self.run_root())?;
+                    StageOutcome {
+                        artifact_paths: vec!["SHA256SUMS".into()],
+                        ..Default::default()
+                    }
+                }
+                other => bail!("stage {other:?} cannot run without a persisted run plan"),
+            };
+            self.complete_stage(stage, outcome)?;
+        }
+        Ok(LifecycleStatus::InvalidArchived)
     }
 
     pub fn invalidate(&mut self, reason: RunInvalidation) -> Result<()> {
@@ -488,7 +589,17 @@ impl RunController {
     }
 }
 
-fn query_sample_counts(records: &[StageQueryRecord]) -> Vec<u64> {
+fn stage_policy(plan: &RunPlan, stage: RunStage) -> Option<QueryStagePolicy> {
+    let mut policy = QueryStagePolicy::for_stage(&plan.spec, stage)?;
+    if plan.mode == RunMode::Isolated {
+        let engines = u32::try_from(plan.engines.len()).unwrap_or(u32::MAX).max(1);
+        policy.scheduled_duration = policy.scheduled_duration.saturating_mul(engines);
+        policy.maximum_duration = policy.maximum_duration.saturating_mul(engines);
+    }
+    Some(policy)
+}
+
+fn query_sample_counts(records: &[StageQueryRecord], engines: &[EngineKind]) -> Vec<u64> {
     use crate::query::QueryId;
     [
         QueryId::Q1,
@@ -498,11 +609,15 @@ fn query_sample_counts(records: &[StageQueryRecord]) -> Vec<u64> {
         QueryId::Q5,
     ]
     .iter()
-    .map(|query| {
-        records
-            .iter()
-            .filter(|record| record.query == *query && !record.failed)
-            .count() as u64
+    .flat_map(|query| {
+        engines.iter().map(move |engine| {
+            records
+                .iter()
+                .filter(|record| {
+                    record.engine == Some(*engine) && record.query == *query && !record.failed
+                })
+                .count() as u64
+        })
     })
     .collect()
 }
@@ -651,6 +766,9 @@ impl IsolatedReplayEvidence {
             .workload_hashes
             .first()
             .ok_or_else(|| anyhow::anyhow!("isolated replay has no workload hash"))?;
+        if expected.is_empty() {
+            bail!("isolated replay committed ledger is empty");
+        }
         validate_workload_hashes(expected, &self.workload_hashes)?;
         if self.replay_maps.len() != 2 || self.logical_checkpoints.len() != 2 {
             bail!("isolated mode requires exactly two replay maps and matching checkpoints");
@@ -659,6 +777,9 @@ impl IsolatedReplayEvidence {
             bail!("isolated engines did not reach the same logical checkpoint");
         }
         let first = &self.replay_maps[0];
+        if first.is_empty() {
+            bail!("isolated replay maps contain no committed operation");
+        }
         for map in &self.replay_maps[1..] {
             if first.len() != map.len()
                 || first.iter().zip(map).any(|(a, b)| {
@@ -730,6 +851,15 @@ pub fn build_isolated_replays(
     Ok(evidence)
 }
 
+/// The frozen rate-search ladder from the benchmark spec.  This is the single
+/// definition; the runtime's executed steps and the policy's scheduled
+/// duration both derive from it.
+pub(crate) fn search_rates(maximum: u64) -> impl Iterator<Item = u64> {
+    [2_000_u64, 4_000, 8_000, 16_000, 32_000, 64_000]
+        .into_iter()
+        .filter(move |rate| *rate <= maximum)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryStagePolicy {
     pub scheduled_duration: Duration,
@@ -743,7 +873,10 @@ impl QueryStagePolicy {
             RunStage::Warmup => profile.warmup_secs,
             RunStage::Quiet => profile.quiet_secs,
             RunStage::Cdc300 | RunStage::Cdc1000 => profile.fixed_rate_secs,
-            RunStage::RateSearch => profile.search_step_secs,
+            RunStage::RateSearch => {
+                let steps = search_rates(profile.maximum_rate).count() as u64;
+                profile.search_step_secs.saturating_mul(steps)
+            }
             _ => return None,
         };
         let scheduled_duration = Duration::from_secs(seconds);
@@ -756,14 +889,15 @@ impl QueryStagePolicy {
 
     pub fn validates(&self, query_samples: &[u64], elapsed: Duration) -> bool {
         elapsed <= self.maximum_duration
-            && query_samples.len() == 5
+            && !query_samples.is_empty()
+            && query_samples.len().is_multiple_of(5)
             && query_samples
                 .iter()
                 .all(|samples| *samples >= self.minimum_samples_per_query)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateSearchObservation {
     pub target_rows_per_sec: u64,
     pub achieved_rows_per_sec: u64,

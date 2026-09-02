@@ -6,7 +6,7 @@ use graydb_r1::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -164,13 +164,35 @@ impl BenchmarkRuntime for LifecycleRuntime {
                 for _ in 0..30 {
                     outcome.query_records.push(StageQueryRecord {
                         query,
+                        engine: Some(EngineKind::Graydb),
+                        target_rows_per_sec: None,
+                        logical_checkpoint: 1,
                         started_at_unix_ms: 1,
+                        completed_at_unix_ms: Some(2),
                         target_lsn: 10,
                         visible_lsn: 10,
                         canonical_digest: "digest".into(),
                         elapsed_ns: 1,
+                        rows_read: Some(1),
                         bytes_read: Some(1),
                         failed: false,
+                        failure: None,
+                    });
+                    outcome.query_records.push(StageQueryRecord {
+                        query,
+                        engine: Some(EngineKind::Clickhouse),
+                        target_rows_per_sec: None,
+                        logical_checkpoint: 1,
+                        started_at_unix_ms: 1,
+                        completed_at_unix_ms: Some(2),
+                        target_lsn: 10,
+                        visible_lsn: 10,
+                        canonical_digest: "digest".into(),
+                        elapsed_ns: 1,
+                        rows_read: Some(1),
+                        bytes_read: Some(1),
+                        failed: false,
+                        failure: None,
                     });
                 }
             }
@@ -214,11 +236,9 @@ async fn fake_runtime_drives_exact_lifecycle_and_persists_artifacts() {
         input_hashes: BTreeMap::from([("dataset".into(), "hash".into())]),
     };
     let mut runtime = LifecycleRuntime::default();
+    controller.set_plan(plan.clone()).unwrap();
     assert_eq!(
-        controller
-            .run_to_terminal(&plan, &mut runtime)
-            .await
-            .unwrap(),
+        controller.run_to_terminal(&mut runtime).await.unwrap(),
         LifecycleStatus::Complete
     );
     assert_eq!(runtime.stages, RunStage::ordered());
@@ -245,10 +265,8 @@ async fn isolated_mode_rejects_mismatched_replay_hashes_before_query_stages() {
         input_hashes: BTreeMap::new(),
     };
     let mut runtime = BadIsolatedRuntime(LifecycleRuntime::default());
-    assert!(controller
-        .run_to_terminal(&plan, &mut runtime)
-        .await
-        .is_err());
+    controller.set_plan(plan.clone()).unwrap();
+    assert!(controller.run_to_terminal(&mut runtime).await.is_err());
     assert_eq!(
         runtime.0.stages,
         vec![
@@ -257,7 +275,31 @@ async fn isolated_mode_rejects_mismatched_replay_hashes_before_query_stages() {
             RunStage::BaselineSnapshot
         ]
     );
-    assert_eq!(controller.next_stage(), Some(RunStage::BaselineSnapshot));
+    assert_eq!(controller.next_stage(), Some(RunStage::Report));
+}
+
+#[tokio::test]
+async fn legacy_planless_run_is_invalidated_and_archived_without_benchmark_stages() {
+    let fixture = ControllerFixture::new();
+    let mut controller = fixture.create();
+    // No set_plan call: reproduces run state created before plan persistence.
+    let mut runtime = LifecycleRuntime::default();
+    let status = controller.run_to_terminal(&mut runtime).await.unwrap();
+    assert_eq!(status, LifecycleStatus::InvalidArchived);
+    // Report and checksums are archived in-crate; no benchmark stage ran.
+    assert!(runtime.stages.is_empty());
+    assert_eq!(controller.execution_count(RunStage::Preflight), 0);
+    assert_eq!(controller.execution_count(RunStage::Seed), 0);
+    match controller.state().invalidations.first() {
+        Some(graydb_r1::RunInvalidation::MissingArtifact(reason)) => {
+            assert!(reason.contains("run plan"));
+        }
+        other => panic!("expected exact missing-plan invalidation, got {other:?}"),
+    }
+    let root = fixture.root.path().join(fixture.run_id);
+    assert!(root.join("result.json").is_file());
+    assert!(root.join("result.md").is_file());
+    assert!(root.join("SHA256SUMS").is_file());
 }
 
 #[test]
@@ -281,10 +323,23 @@ impl ComposeControl for FakeCompose {
 
 struct FakeWorkload {
     reads: AtomicU64,
+    lsn: AtomicU64,
+    validations: Mutex<Vec<EngineKind>>,
 }
 
 #[async_trait::async_trait]
 impl FailureWorkload for FakeWorkload {
+    async fn wait_for_steady_state(
+        &self,
+        target_rows_per_second: u64,
+        duration: Duration,
+    ) -> anyhow::Result<()> {
+        assert_eq!(target_rows_per_second, 1_000);
+        assert_eq!(duration, Duration::from_secs(120));
+        tokio::time::sleep(duration).await;
+        Ok(())
+    }
+
     async fn source_rows_written(&self) -> anyhow::Result<u64> {
         Ok(self.reads.fetch_add(100, Ordering::SeqCst))
     }
@@ -313,12 +368,67 @@ impl FailureWorkload for FakeWorkload {
     async fn resume_writer(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn source_lsn(&self) -> anyhow::Result<u64> {
+        Ok(self.lsn.fetch_add(1_000, Ordering::SeqCst))
+    }
+
+    async fn received_lsn(&self, _engine: EngineKind) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+
+    async fn applied_lsn(&self, _engine: EngineKind) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+
+    async fn replay_count(&self, _engine: EngineKind) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+
+    async fn missing_operations(
+        &self,
+        _engine: EngineKind,
+        _from: u64,
+        _through: u64,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn duplicate_operations(
+        &self,
+        _engine: EngineKind,
+        _from: u64,
+        _through: u64,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn out_of_order_operations(
+        &self,
+        _engine: EngineKind,
+        _from: u64,
+        _through: u64,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn validate_lsn_range(
+        &self,
+        engine: EngineKind,
+        _from: u64,
+        _through: u64,
+    ) -> anyhow::Result<CorrectnessVerdict> {
+        self.validations.lock().unwrap().push(engine);
+        self.validate(engine).await
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn planned_engine_kill_keeps_writes_running_and_validates_catchup() {
     let workload = Arc::new(FakeWorkload {
         reads: AtomicU64::new(100),
+        lsn: AtomicU64::new(1_000),
+        validations: Mutex::new(Vec::new()),
     });
     let runner = FailureRunner::new(Arc::new(FakeCompose), workload);
     let result = runner
@@ -328,4 +438,52 @@ async fn planned_engine_kill_keeps_writes_running_and_validates_catchup() {
     assert!(result.source_rows_written_while_down > 0);
     assert!(result.caught_up_within(Duration::from_secs(1_800)));
     assert!(result.correctness.passed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn writer_restart_waits_for_steady_state_and_validates_both_engines() {
+    let workload = Arc::new(FakeWorkload {
+        reads: AtomicU64::new(100),
+        lsn: AtomicU64::new(1_000),
+        validations: Mutex::new(Vec::new()),
+    });
+    let runner = FailureRunner::new(Arc::new(FakeCompose), workload.clone());
+    let started = tokio::time::Instant::now();
+
+    runner.run_writer_restart_with_evidence().await.unwrap();
+
+    assert_eq!(started.elapsed(), Duration::from_secs(150));
+    assert_eq!(
+        *workload.validations.lock().unwrap(),
+        vec![EngineKind::Graydb, EngineKind::Clickhouse]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn complete_failure_sequence_has_two_minutes_of_steady_state_before_each_fault() {
+    let workload = Arc::new(FakeWorkload {
+        reads: AtomicU64::new(100),
+        lsn: AtomicU64::new(1_000),
+        validations: Mutex::new(Vec::new()),
+    });
+    let runner = FailureRunner::new(Arc::new(FakeCompose), workload);
+    let started = tokio::time::Instant::now();
+
+    runner
+        .run_failure_sequence([
+            graydb_r1::CdcEndpoint {
+                network: "graydb-r1_default".into(),
+                endpoint: "graydb".into(),
+                engine: EngineKind::Graydb,
+            },
+            graydb_r1::CdcEndpoint {
+                network: "graydb-r1_default".into(),
+                endpoint: "clickhouse".into(),
+                engine: EngineKind::Clickhouse,
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(started.elapsed(), Duration::from_secs(990));
 }

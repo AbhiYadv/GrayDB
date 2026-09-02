@@ -14,6 +14,7 @@ pub mod preflight;
 pub mod query;
 pub mod replication;
 pub mod report;
+pub mod runtime;
 pub mod verdict;
 pub mod workload;
 
@@ -66,6 +67,11 @@ pub use replication::{
     ReplayMapEntry, WorkloadReplayer,
 };
 pub use report::{AwsCapacityRequest, ReportWriter, RunResult};
+pub use runtime::{
+    baseline_path, write_runtime_checksums, DiskSpaceSample, HttpEngines, MacComposeRuntime,
+    R1RuntimeServices, RuntimeClock, RuntimeStageEvidence, SystemR1RuntimeServices,
+    SystemRuntimeClock,
+};
 pub use verdict::{CellVerdict, RunInvalidation, Scorecard, WinnerEvaluation};
 pub use workload::{
     CustomerRow, Operation, OrderEventRow, OrderRow, RateInterval, RateLimiter, RowMix,
