@@ -1,0 +1,48 @@
+[source]
+host = "postgres"
+port = 5432
+dbname = "r1"
+user = "r1"
+password = "graydb_r1"
+schema = "r1"
+publication = "graydb_r1_pub"
+slot = "graydb_r1_slot"
+
+[initial_load]
+copy_streams = 8
+read_budget_pct = 25
+
+[wal_budget]
+bytes_cap = 53687091200
+time_cap_secs = 14400
+warn_fraction = 0.5
+shed_fraction = 0.7
+
+[log]
+segment_max_bytes = 67108864
+
+[columnar]
+flush_rows = 100000
+
+[search]
+commit_batch_txns = 64
+
+[[search.indexes]]
+table = "r1.customers"
+columns = ["segment", "email_domain"]
+
+[[search.indexes]]
+table = "r1.orders"
+columns = ["status", "channel"]
+
+[consistency]
+session_default = "bounded(5)"
+heartbeat_secs = 1
+
+[retention]
+historical_window_days = 7
+base_refresh_fraction = 0.5
+base_refresh_days = 7
+
+[storage]
+data_dir = "/var/lib/graydb"
