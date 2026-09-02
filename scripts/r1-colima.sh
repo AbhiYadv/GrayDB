@@ -3,6 +3,9 @@ set -euo pipefail
 
 readonly R1_APPROVED_PREFIX="/Volumes/Crucial X9/GrayDB/.r1"
 readonly R1_REPOSITORY_ROOT="/Volumes/Crucial X9/GrayDB"
+readonly R1_DOCKER_CONTEXT="colima-r1"
+readonly R1_COLIMA_CONFIG="${COLIMA_HOME:-$HOME/.colima}/r1/colima.yaml"
+readonly R1_SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 R1_DATA_ROOT="${R1_DATA_ROOT:-$R1_APPROVED_PREFIX}"
 
 fail() {
@@ -46,13 +49,71 @@ create_named_children() {
     "$R1_DATA_ROOT/metadata"
 }
 
+config_scalar() {
+  local key="$1"
+  awk -v key="$key:" '$1 == key { value = $2; gsub(/^"|"$/, "", value); print value; exit }' "$R1_COLIMA_CONFIG"
+}
+
+validate_r1_profile() {
+  local cpus memory disk disk_image expected_disk_image
+  [[ -r "$R1_COLIMA_CONFIG" ]] || fail "r1 profile config is unreadable: $R1_COLIMA_CONFIG"
+
+  cpus="$(config_scalar cpu)"
+  memory="$(config_scalar memory)"
+  disk="$(config_scalar disk)"
+  disk_image="$(config_scalar diskImage)"
+  expected_disk_image="$R1_DATA_ROOT/colima/disk.img"
+
+  [[ "$cpus" == "8" ]] || fail "r1 profile CPU must be 8, found ${cpus:-unset}"
+  [[ "$memory" == "12" || "$memory" == "12.0" ]] || fail "r1 profile memory must be 12 GiB, found ${memory:-unset}"
+  [[ "$disk" == "600" ]] || fail "r1 profile disk must be 600 GiB, found ${disk:-unset}"
+  [[ "$disk_image" == "$expected_disk_image" ]] || fail "r1 disk image must be $expected_disk_image, found ${disk_image:-unset}"
+
+  awk -v expected="$R1_REPOSITORY_ROOT" '
+    function unquote(value) { gsub(/^"|"$/, "", value); return value }
+    $1 == "-" && $2 == "location:" { location = unquote($3); writable = ""; next }
+    $1 == "location:" { location = unquote($2); writable = ""; next }
+    $1 == "writable:" && $2 == "true" && location == expected { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$R1_COLIMA_CONFIG" || fail "r1 profile must have writable mount $R1_REPOSITORY_ROOT"
+}
+
+validate_running_resources() {
+  local status_json="$1"
+  command -v jq >/dev/null || fail "jq is required to validate the running r1 profile"
+  printf '%s' "$status_json" | jq -e \
+    --argjson memory "$((12 << 30))" \
+    --argjson disk "$((600 << 30))" \
+    '.cpu == 8 and .memory == $memory and .disk == $disk' >/dev/null \
+    || fail "running r1 profile must report exactly 8 CPU, 12 GiB memory, and 600 GiB disk"
+}
+
+ensure_r1_docker_context() {
+  docker context inspect "$R1_DOCKER_CONTEXT" >/dev/null \
+    || fail "Docker context $R1_DOCKER_CONTEXT is unavailable"
+  [[ "$(docker context show)" == "$R1_DOCKER_CONTEXT" ]] \
+    || fail "Docker context must be $R1_DOCKER_CONTEXT before R1 image work; refusing to switch another context"
+}
+
+build_r1ctl_when_available() {
+  local r1ctl_source="$R1_SOURCE_ROOT/crates/graydb-r1/src/bin/r1ctl.rs"
+  if [[ ! -f "$r1ctl_source" ]]; then
+    printf 'r1ctl build deferred: Task 12 owns %s; then run: cargo build --release -p graydb-r1 --bin r1ctl\n' "$r1ctl_source"
+    return
+  fi
+  (
+    cd "$R1_SOURCE_ROOT"
+    cargo build --release -p graydb-r1 --bin r1ctl
+  )
+}
+
 record_repository_digest() {
   local image="$1" record digest existing
   record="$R1_DATA_ROOT/metadata/${image//\//_}.repository-digest"
   record="${record//:/_}"
 
-  docker pull "$image" >/dev/null
-  digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
+  docker --context "$R1_DOCKER_CONTEXT" pull "$image" >/dev/null
+  digest="$(docker --context "$R1_DOCKER_CONTEXT" image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
     | awk -v image="$image" '$0 ~ "^" image "@" { print; exit }')"
   [[ -n "$digest" ]] || fail "no repository digest found for $image"
 
@@ -69,9 +130,10 @@ record_repository_digest() {
 
 canonicalize_data_root
 create_named_children
+build_r1ctl_when_available
 
-if colima status --profile r1 2>/dev/null | grep -qi 'running'; then
-  printf 'Colima profile r1 is already running; inspecting without recreation.\n'
+if colima status --profile r1 --json >/dev/null 2>&1; then
+  printf 'Colima profile r1 is already running; validating without recreation.\n'
 else
   colima start --profile r1 \
     --cpu 8 \
@@ -81,6 +143,10 @@ else
     --mount /Volumes/Crucial\ X9/GrayDB:w
 fi
 
+R1_STATUS_JSON="$(colima status --profile r1 --json)"
+validate_running_resources "$R1_STATUS_JSON"
+validate_r1_profile
+ensure_r1_docker_context
 record_repository_digest postgres:17
 record_repository_digest clickhouse/clickhouse-server:25.8
 
