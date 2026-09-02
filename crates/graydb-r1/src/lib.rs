@@ -6,10 +6,12 @@ pub mod generator;
 pub mod graydb;
 pub mod ledger;
 pub mod manifest;
+pub mod metrics;
 pub mod oracle;
 pub mod preflight;
 pub mod query;
 pub mod replication;
+pub mod report;
 pub mod verdict;
 pub mod workload;
 
@@ -30,6 +32,10 @@ pub use manifest::{
     PostgresCopySink, PostgresPublishedSizeProbe, PublishedSizeProbe, TableManifest,
     PUBLISHED_TABLE_BYTES_SQL,
 };
+pub use metrics::{
+    FreshnessMetricKey, LatencySeries, LatencySummary, Metrics, QueryMetricKey, ResourceSample,
+    ResourceSampler, StageTimer, StageTiming,
+};
 pub use oracle::{
     CapturedCheckpoint, CheckpointVerdictSink, CorrectnessVerdict, EngineCheckpointEvidence,
     LedgerOracle, PostgresCheckpoint, RowDifference, RowSample, SampledCheckpointEngine,
@@ -44,6 +50,7 @@ pub use replication::{
     ApplicationWriter, ControlLsnMapper, ControlReplicationConfig, LedgerCommit, ReplayMap,
     ReplayMapEntry, WorkloadReplayer,
 };
+pub use report::{AwsCapacityRequest, ReportWriter, RunResult};
 pub use verdict::{CellVerdict, RunInvalidation, Scorecard, WinnerEvaluation};
 pub use workload::{
     CustomerRow, Operation, OrderEventRow, OrderRow, RateInterval, RateLimiter, RowMix,
