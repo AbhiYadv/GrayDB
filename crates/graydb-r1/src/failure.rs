@@ -23,6 +23,7 @@ pub struct CdcEndpoint {
     /// standalone CDC service.
     pub network: String,
     pub endpoint: String,
+    pub engine: EngineKind,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,6 +148,8 @@ pub struct FailureSequenceResult {
     pub engine_failures: Vec<EngineFailureResult>,
     pub cdc_interruptions: Vec<Vec<CommandOutcome>>,
     pub restart_exit_code: i32,
+    pub cdc_evidence: Vec<FailureEvidence>,
+    pub writer_evidence: FailureEvidence,
 }
 
 impl EngineFailureResult {
@@ -228,18 +231,75 @@ where
     }
 
     pub async fn run_cdc_disconnect(&self, endpoint: &CdcEndpoint) -> Result<Vec<CommandOutcome>> {
+        Ok(self.run_cdc_disconnect_with_evidence(endpoint).await?.0)
+    }
+
+    pub async fn run_cdc_disconnect_with_evidence(
+        &self,
+        endpoint: &CdcEndpoint,
+    ) -> Result<(Vec<CommandOutcome>, FailureEvidence)> {
+        let before = self.workload.source_lsn().await?;
+        let started_at_unix_ms = unix_ms();
         let disconnected = self.compose.disconnect_cdc(endpoint).await?;
         require_success(&disconnected)?;
         tokio::time::sleep(CDC_OUTAGE).await;
         let reconnected = self.compose.reconnect_cdc(endpoint).await?;
         require_success(&reconnected)?;
-        Ok(vec![disconnected, reconnected])
+        let after = self.workload.source_lsn().await?;
+        let evidence = FailureEvidence {
+            command: vec![
+                "docker".into(),
+                "network".into(),
+                "disconnect".into(),
+                endpoint.network.clone(),
+                endpoint.endpoint.clone(),
+            ],
+            signal: "planned-cdc-disconnect".into(),
+            started_at_unix_ms,
+            source_lsn_before: before,
+            source_lsn_after: after,
+            last_received_lsn: self.workload.received_lsn(endpoint.engine).await?,
+            last_applied_lsn: self.workload.applied_lsn(endpoint.engine).await?,
+            restart_duration: CDC_OUTAGE,
+            catchup_duration: Duration::ZERO,
+            replay_count: self.workload.replay_count(endpoint.engine).await?,
+            lsn_range_validated: self
+                .workload
+                .validate_lsn_range(endpoint.engine, before, after)
+                .await?
+                .passed,
+        };
+        Ok((vec![disconnected, reconnected], evidence))
     }
 
     pub async fn run_writer_restart(&self) -> Result<()> {
+        self.run_writer_restart_with_evidence().await.map(|_| ())
+    }
+
+    pub async fn run_writer_restart_with_evidence(&self) -> Result<FailureEvidence> {
+        let before = self.workload.source_lsn().await?;
+        let started_at_unix_ms = unix_ms();
         self.workload.stop_writer().await?;
         tokio::time::sleep(WRITER_OUTAGE).await;
-        self.workload.resume_writer().await
+        self.workload.resume_writer().await?;
+        let after = self.workload.source_lsn().await?;
+        let verdict = self
+            .workload
+            .validate_lsn_range(EngineKind::Graydb, before, after)
+            .await?;
+        Ok(FailureEvidence {
+            command: vec!["writer".into(), "stop".into(), "resume".into()],
+            signal: "planned-writer-restart".into(),
+            started_at_unix_ms,
+            source_lsn_before: before,
+            source_lsn_after: after,
+            last_received_lsn: self.workload.received_lsn(EngineKind::Graydb).await?,
+            last_applied_lsn: self.workload.applied_lsn(EngineKind::Graydb).await?,
+            restart_duration: WRITER_OUTAGE,
+            catchup_duration: Duration::ZERO,
+            replay_count: self.workload.replay_count(EngineKind::Graydb).await?,
+            lsn_range_validated: verdict.passed,
+        })
     }
 
     /// Executes the fixed correctness-mode sequence in spec section 14.  The
@@ -254,13 +314,19 @@ where
         let clickhouse = self
             .run_engine_kill(EngineKind::Clickhouse, ENGINE_OUTAGE)
             .await?;
-        let graydb_cdc = self.run_cdc_disconnect(&cdc_endpoints[0]).await?;
-        let clickhouse_cdc = self.run_cdc_disconnect(&cdc_endpoints[1]).await?;
-        self.run_writer_restart().await?;
+        let (graydb_cdc, graydb_evidence) = self
+            .run_cdc_disconnect_with_evidence(&cdc_endpoints[0])
+            .await?;
+        let (clickhouse_cdc, clickhouse_evidence) = self
+            .run_cdc_disconnect_with_evidence(&cdc_endpoints[1])
+            .await?;
+        let writer_evidence = self.run_writer_restart_with_evidence().await?;
         Ok(FailureSequenceResult {
             engine_failures: vec![graydb, clickhouse],
             cdc_interruptions: vec![graydb_cdc, clickhouse_cdc],
             restart_exit_code: CONTROLLER_RESTART_EXIT_CODE,
+            cdc_evidence: vec![graydb_evidence, clickhouse_evidence],
+            writer_evidence,
         })
     }
 }
@@ -376,6 +442,8 @@ mod tests {
             .engine_failures
             .iter()
             .all(|failure| failure.evidence.lsn_range_validated));
+        assert_eq!(result.cdc_evidence.len(), 2);
+        assert!(result.writer_evidence.lsn_range_validated);
     }
 
     #[test]
@@ -391,10 +459,12 @@ mod tests {
             CdcEndpoint {
                 network: "graydb-r1_default".into(),
                 endpoint: "graydb".into(),
+                engine: EngineKind::Graydb,
             },
             CdcEndpoint {
                 network: "graydb-r1_default".into(),
                 endpoint: "clickhouse".into(),
+                engine: EngineKind::Clickhouse,
             },
         ]
     }

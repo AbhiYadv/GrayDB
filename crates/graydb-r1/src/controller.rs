@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MINIMUM_QUERY_SAMPLES: u64 = 30;
 pub const RUNTIME_FREE_SPACE_FLOOR_PERCENT: u8 = 15;
@@ -124,7 +124,7 @@ pub struct StageQueryRecord {
     pub failed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunPlan {
     pub profile: ScaleProfile,
     pub spec: ProfileSpec,
@@ -179,6 +179,8 @@ pub struct RunState {
     pub run_id: String,
     pub stages: BTreeMap<RunStage, StageRecord>,
     pub invalidations: Vec<RunInvalidation>,
+    #[serde(default)]
+    pub plan: Option<RunPlan>,
 }
 
 impl RunState {
@@ -187,6 +189,7 @@ impl RunState {
             run_id: run_id.into(),
             stages: BTreeMap::new(),
             invalidations: Vec::new(),
+            plan: None,
         }
     }
 
@@ -276,6 +279,26 @@ impl RunController {
 
     pub fn state(&self) -> &RunState {
         &self.state
+    }
+
+    pub fn set_plan(&mut self, plan: RunPlan) -> Result<()> {
+        if let Some(existing) = &self.state.plan {
+            if existing.profile != plan.profile
+                || existing.mode != plan.mode
+                || existing.engines != plan.engines
+            {
+                bail!("run plan is immutable once persisted");
+            }
+        }
+        self.state.plan = Some(plan);
+        self.persist()
+    }
+
+    pub fn plan(&self) -> Result<&RunPlan> {
+        self.state
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("run plan was not persisted"))
     }
 
     pub fn next_stage(&self) -> Option<RunStage> {
@@ -392,6 +415,7 @@ impl RunController {
         while let Some(stage) = self.next_stage() {
             let hashes = plan.input_hashes.clone();
             self.begin_stage(stage, hashes)?;
+            let started = Instant::now();
             let outcome = {
                 let context = StageContext {
                     stage,
@@ -408,7 +432,7 @@ impl RunController {
             };
             if let Some(policy) = QueryStagePolicy::for_stage(&plan.spec, stage) {
                 let samples = query_sample_counts(&outcome.query_records);
-                if !policy.validates(&samples, policy.scheduled_duration) {
+                if !policy.validates(&samples, started.elapsed()) {
                     self.complete_stage(
                         stage,
                         StageOutcome {

@@ -113,6 +113,33 @@ fn stage_cannot_complete_without_a_durable_start_record() {
         .is_err());
 }
 
+#[test]
+fn persisted_plan_survives_resume_without_profile_or_mode_substitution() {
+    let fixture = ControllerFixture::new();
+    let mut controller = fixture.create();
+    let catalog = ProfileCatalog::load(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/r1/profiles.toml"),
+    )
+    .unwrap();
+    controller
+        .set_plan(RunPlan {
+            profile: ScaleProfile::AwsPhase1,
+            spec: catalog.get(ScaleProfile::AwsPhase1).unwrap().clone(),
+            mode: RunMode::Isolated,
+            engines: vec![EngineKind::Clickhouse],
+            input_hashes: BTreeMap::new(),
+        })
+        .unwrap();
+    drop(controller);
+    let resumed = fixture.resume();
+    assert_eq!(resumed.plan().unwrap().profile, ScaleProfile::AwsPhase1);
+    assert_eq!(resumed.plan().unwrap().mode, RunMode::Isolated);
+    assert_eq!(
+        resumed.plan().unwrap().engines,
+        vec![EngineKind::Clickhouse]
+    );
+}
+
 #[derive(Default)]
 struct LifecycleRuntime {
     stages: Vec<RunStage>,

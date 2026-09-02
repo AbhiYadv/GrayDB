@@ -45,6 +45,25 @@ fn invalidation_self_test_writes_no_benchmark_result() {
 fn invalid_resume_generates_only_report_and_checksums_then_exits_nonzero() {
     let root = tempdir().unwrap();
     let mut controller = graydb_r1::RunController::create(root.path(), "invalid-cli").unwrap();
+    let catalog = graydb_r1::ProfileCatalog::load(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/r1/profiles.toml"),
+    )
+    .unwrap();
+    controller
+        .set_plan(graydb_r1::RunPlan {
+            profile: graydb_r1::ScaleProfile::MacSmoke,
+            spec: catalog
+                .get(graydb_r1::ScaleProfile::MacSmoke)
+                .unwrap()
+                .clone(),
+            mode: graydb_r1::RunMode::Correctness,
+            engines: vec![
+                graydb_r1::EngineKind::Graydb,
+                graydb_r1::EngineKind::Clickhouse,
+            ],
+            input_hashes: Default::default(),
+        })
+        .unwrap();
     controller
         .invalidate(graydb_r1::RunInvalidation::DatasetHashMismatch)
         .unwrap();

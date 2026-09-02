@@ -86,20 +86,18 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
         } => {
             validate_engines(mode, &engines)?;
             let run_id = run_id.unwrap_or_else(new_run_id);
+            let plan = load_plan(profile, mode, engines)?;
             let mut controller = RunController::create(&cli.run_root, &run_id)?;
+            controller.set_plan(plan.clone())?;
             controller.note("operator requested benchmark run")?;
             print_run_header(&cli, &run_id, controller.run_root());
-            run_plan(&mut controller, profile, mode, engines)
+            run_plan(&mut controller, plan)
         }
         Command::Resume { run_id } => {
             let mut controller = RunController::resume(&cli.run_root, &run_id)?;
             controller.note("operator requested resume")?;
             print_run_header(&cli, &run_id, controller.run_root());
-            let plan = load_plan(
-                ScaleProfile::MacSmoke,
-                RunMode::Correctness,
-                vec![EngineKind::Graydb, EngineKind::Clickhouse],
-            )?;
+            let plan = controller.plan()?.clone();
             let mut runtime = MacComposeRuntime;
             match block_on(controller.run_to_terminal(&plan, &mut runtime))? {
                 LifecycleStatus::Complete => Ok(()),
@@ -118,18 +116,10 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn incomplete_subcommand(cli: &Cli, run_id: &str) -> anyhow::Result<()> {
-    let mut controller = if cli.run_root.join(run_id).join("run-state.json").exists() {
-        RunController::resume(&cli.run_root, run_id)?
-    } else {
-        RunController::create(&cli.run_root, run_id)?
-    };
+    let mut controller = RunController::resume(&cli.run_root, run_id)?;
     controller.note("operator requested a single controller subcommand")?;
     print_run_header(cli, run_id, controller.run_root());
-    let plan = load_plan(
-        ScaleProfile::MacSmoke,
-        RunMode::Correctness,
-        vec![EngineKind::Graydb, EngineKind::Clickhouse],
-    )?;
+    let plan = controller.plan()?.clone();
     let mut runtime = MacComposeRuntime;
     match block_on(controller.run_to_terminal(&plan, &mut runtime))? {
         LifecycleStatus::Complete => Ok(()),
@@ -159,13 +149,7 @@ fn self_test_invalidations(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_plan(
-    controller: &mut RunController,
-    profile: ScaleProfile,
-    mode: RunMode,
-    engines: Vec<EngineKind>,
-) -> anyhow::Result<()> {
-    let plan = load_plan(profile, mode, engines)?;
+fn run_plan(controller: &mut RunController, plan: RunPlan) -> anyhow::Result<()> {
     let mut runtime = MacComposeRuntime;
     match block_on(controller.run_to_terminal(&plan, &mut runtime))? {
         LifecycleStatus::Complete => Ok(()),
