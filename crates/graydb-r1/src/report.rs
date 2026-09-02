@@ -62,6 +62,7 @@ pub struct RunResult {
     pub scorecard: Option<Scorecard>,
     pub winner: Option<WinnerEvaluation>,
     pub resource_samples: Vec<ResourceSample>,
+    #[serde(skip)]
     pub raw_metrics: Vec<RawMetricSample>,
     pub artifact_paths: Vec<String>,
 }
@@ -318,5 +319,31 @@ mod tests {
         ] {
             assert!(report.contains(label), "missing {label}");
         }
+    }
+
+    #[test]
+    fn raw_metrics_are_artifact_only_and_not_in_result_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = RunResult::default();
+        result
+            .raw_metrics
+            .push(RawMetricSample::resource(ResourceSample {
+                monotonic_ns: 11,
+                service: "graydb".into(),
+                cpu_percent: 1.0,
+                memory_bytes: 2,
+                block_read_bytes: 3,
+                block_write_bytes: 4,
+                network_rx_bytes: 5,
+                network_tx_bytes: 6,
+            }));
+        ReportWriter::write(dir.path(), &result).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("result.json")).unwrap())
+                .unwrap();
+        assert!(json.get("raw_metrics").is_none());
+        let raw = std::fs::read_to_string(dir.path().join("metrics/metrics.jsonl")).unwrap();
+        assert!(raw.contains("docker_resource"));
+        assert!(raw.contains("graydb"));
     }
 }
