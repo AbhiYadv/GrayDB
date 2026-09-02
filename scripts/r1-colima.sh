@@ -51,7 +51,9 @@ create_named_children() {
 
 config_scalar() {
   local key="$1"
-  awk -v key="$key:" '$1 == key { value = $2; gsub(/^"|"$/, "", value); print value; exit }' "$R1_COLIMA_CONFIG"
+  # Print everything after "key:" — values may contain spaces (for example
+  # the disk image path "/Volumes/Crucial X9/..."), so $2 alone is wrong.
+  awk -v key="$key:" '$1 == key { sub(/^[^:]*:[[:space:]]*/, ""); gsub(/,$/, ""); gsub(/^"|"$/, ""); print; exit }' "$R1_COLIMA_CONFIG"
 }
 
 validate_r1_profile() {
@@ -71,8 +73,16 @@ validate_r1_profile() {
 
   awk -v expected="$R1_REPOSITORY_ROOT" '
     function unquote(value) { gsub(/^"|"$/, "", value); return value }
-    $1 == "-" && $2 == "location:" { location = unquote($3); writable = ""; next }
-    $1 == "location:" { location = unquote($2); writable = ""; next }
+    $1 == "-" && $2 == "location:" {
+      value = $0
+      sub(/^.*location:[[:space:]]*/, "", value)
+      location = unquote(value); writable = ""; next
+    }
+    $1 == "location:" {
+      value = $0
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      location = unquote(value); writable = ""; next
+    }
     $1 == "writable:" && $2 == "true" && location == expected { found = 1 }
     END { exit(found ? 0 : 1) }
   ' "$R1_COLIMA_CONFIG" || fail "r1 profile must have writable mount $R1_REPOSITORY_ROOT"
@@ -113,8 +123,11 @@ record_repository_digest() {
   record="${record//:/_}"
 
   docker --context "$R1_DOCKER_CONTEXT" pull "$image" >/dev/null
+  # RepoDigests lists "postgres@sha256:..." — the tag is not part of the
+  # digest reference, so match on the repository alone.
+  local repository="${image%%:*}"
   digest="$(docker --context "$R1_DOCKER_CONTEXT" image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
-    | awk -v image="$image" '$0 ~ "^" image "@" { print; exit }')"
+    | awk -v image="$repository" '$0 ~ "^" image "@" { print; exit }')"
   [[ -n "$digest" ]] || fail "no repository digest found for $image"
 
   if [[ -f "$record" ]]; then
@@ -140,7 +153,8 @@ else
     --memory 12 \
     --disk 600 \
     --disk-image "$R1_DATA_ROOT/colima/disk.img" \
-    --mount /Volumes/Crucial\ X9/GrayDB:w
+    --mount /Volumes/Crucial\ X9/GrayDB:w \
+    --mount-type 9p
 fi
 
 R1_STATUS_JSON="$(colima status --profile r1 --json)"

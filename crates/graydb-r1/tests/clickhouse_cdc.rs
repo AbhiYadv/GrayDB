@@ -259,7 +259,7 @@ async fn initial_load_and_roundtrip_are_exact_at_every_target_lsn() {
         vec![
             ("paid".to_string(), 1, 100),
             ("pending".to_string(), 1, 300),
-            ("shipped".to_string(), 1, 600),
+            ("shipped".to_string(), 2, 600),
         ]
     );
     let at_lsn2 = q5_by_status(&adapter, lsn2).await;
@@ -268,7 +268,7 @@ async fn initial_load_and_roundtrip_are_exact_at_every_target_lsn() {
         vec![
             ("pending".to_string(), 1, 300),
             ("refunded".to_string(), 1, 150),
-            ("shipped".to_string(), 1, 600),
+            ("shipped".to_string(), 2, 600),
         ]
     );
     let at_lsn3 = q5_by_status(&adapter, lsn3).await;
@@ -277,6 +277,7 @@ async fn initial_load_and_roundtrip_are_exact_at_every_target_lsn() {
         vec![
             ("pending".to_string(), 1, 300),
             ("refunded".to_string(), 1, 150),
+            ("shipped".to_string(), 1, 400),
         ]
     );
 
@@ -309,7 +310,7 @@ async fn initial_load_and_roundtrip_are_exact_at_every_target_lsn() {
         vec![
             ("paid".to_string(), 1, 100),
             ("pending".to_string(), 1, 300),
-            ("shipped".to_string(), 1, 600),
+            ("shipped".to_string(), 2, 600),
         ]
     );
 }

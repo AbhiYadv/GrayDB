@@ -492,13 +492,13 @@ async fn execute_operation(
 ) -> Result<()> {
     match operation {
         Operation::InsertCustomer(row) => {
-            transaction.execute("INSERT INTO r1.customers (customer_id, tenant_id, segment, email_domain, profile, created_at) VALUES ($1,$2,$3,$4,$5::jsonb,to_timestamp($6::double precision / 1000000))", &[&(row.customer_id as i64), &(row.tenant_id as i64), &row.segment, &row.email_domain, &row.profile_json, &(row.created_at_micros as f64)]).await?;
+            transaction.execute("INSERT INTO r1.customers (customer_id, tenant_id, segment, email_domain, profile, created_at) VALUES ($1,$2,$3,$4,$5::text::jsonb,to_timestamp($6::double precision / 1000000))", &[&(row.customer_id as i64), &(row.tenant_id as i64), &row.segment, &row.email_domain, &row.profile_json, &(row.created_at_micros as f64)]).await?;
         }
         Operation::InsertOrder(row) => {
-            transaction.execute("INSERT INTO r1.orders (order_id, tenant_id, customer_id, status, channel, amount_cents, created_at, updated_at, attributes) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000000),to_timestamp($8::double precision / 1000000),$9::jsonb)", &[&(row.order_id as i64), &(row.tenant_id as i64), &(row.customer_id as i64), &row.status, &row.channel, &row.amount_cents, &(row.created_at_micros as f64), &(row.updated_at_micros as f64), &row.attributes_json]).await?;
+            transaction.execute("INSERT INTO r1.orders (order_id, tenant_id, customer_id, status, channel, amount_cents, created_at, updated_at, attributes) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000000),to_timestamp($8::double precision / 1000000),$9::text::jsonb)", &[&(row.order_id as i64), &(row.tenant_id as i64), &(row.customer_id as i64), &row.status, &row.channel, &row.amount_cents, &(row.created_at_micros as f64), &(row.updated_at_micros as f64), &row.attributes_json]).await?;
         }
         Operation::InsertOrderEvent(row) => {
-            transaction.execute("INSERT INTO r1.order_events (event_id, order_id, tenant_id, event_type, event_at, metadata) VALUES ($1,$2,$3,$4,to_timestamp($5::double precision / 1000000),$6::jsonb)", &[&(row.event_id as i64), &(row.order_id as i64), &(row.tenant_id as i64), &row.event_type, &(row.event_at_micros as f64), &row.metadata_json]).await?;
+            transaction.execute("INSERT INTO r1.order_events (event_id, order_id, tenant_id, event_type, event_at, metadata) VALUES ($1,$2,$3,$4,to_timestamp($5::double precision / 1000000),$6::text::jsonb)", &[&(row.event_id as i64), &(row.order_id as i64), &(row.tenant_id as i64), &row.event_type, &(row.event_at_micros as f64), &row.metadata_json]).await?;
         }
         Operation::UpdateCustomer {
             customer_id,
@@ -508,7 +508,7 @@ async fn execute_operation(
             profile_json,
             created_at_micros,
         } => {
-            transaction.execute("UPDATE r1.customers SET tenant_id=$2, segment=$3, email_domain=$4, profile=$5::jsonb, created_at=to_timestamp($6::double precision / 1000000) WHERE customer_id=$1", &[&(*customer_id as i64), &(*tenant_id as i64), segment, email_domain, profile_json, &(*created_at_micros as f64)]).await?;
+            transaction.execute("UPDATE r1.customers SET tenant_id=$2, segment=$3, email_domain=$4, profile=$5::text::jsonb, created_at=to_timestamp($6::double precision / 1000000) WHERE customer_id=$1", &[&(*customer_id as i64), &(*tenant_id as i64), segment, email_domain, profile_json, &(*created_at_micros as f64)]).await?;
         }
         Operation::UpdateOrder {
             order_id,
@@ -521,7 +521,7 @@ async fn execute_operation(
             updated_at_micros,
             attributes_json,
         } => {
-            transaction.execute("UPDATE r1.orders SET tenant_id=$2, customer_id=$3, status=$4, channel=$5, amount_cents=$6, created_at=to_timestamp($7::double precision / 1000000), updated_at=to_timestamp($8::double precision / 1000000), attributes=$9::jsonb WHERE order_id=$1", &[&(*order_id as i64), &(*tenant_id as i64), &(*customer_id as i64), status, channel, amount_cents, &(*created_at_micros as f64), &(*updated_at_micros as f64), attributes_json]).await?;
+            transaction.execute("UPDATE r1.orders SET tenant_id=$2, customer_id=$3, status=$4, channel=$5, amount_cents=$6, created_at=to_timestamp($7::double precision / 1000000), updated_at=to_timestamp($8::double precision / 1000000), attributes=$9::text::jsonb WHERE order_id=$1", &[&(*order_id as i64), &(*tenant_id as i64), &(*customer_id as i64), status, channel, amount_cents, &(*created_at_micros as f64), &(*updated_at_micros as f64), attributes_json]).await?;
         }
         Operation::DeleteOrder {
             order_id,

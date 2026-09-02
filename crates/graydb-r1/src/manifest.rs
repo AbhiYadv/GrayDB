@@ -186,17 +186,20 @@ pub struct TableManifest {
 
 /// The stable, comparable portion of a dataset manifest. It intentionally has
 /// no run identifier, host path, or wall-clock timing.
+/// Logical dataset content: everything two loads of the same seed must agree
+/// on.  Deliberately excludes `initial_lsn` (a per-load WAL position) and the
+/// measured physical byte sizes (page-layout jitter) — the manifest carries
+/// them as observations, but they are not dataset content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetIdentity {
     pub seed: u64,
     pub schema_sha256: String,
     pub dictionary_sha256: String,
-    pub published_table_bytes: u64,
-    pub tables: BTreeMap<String, TableManifest>,
+    /// Table name -> row count.
+    pub tables: BTreeMap<String, u64>,
     pub batches: Vec<BatchManifest>,
     pub postgres_version: String,
     pub postgres_settings: BTreeMap<String, String>,
-    pub initial_lsn: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,12 +226,14 @@ impl DatasetManifest {
             seed: self.seed,
             schema_sha256: self.schema_sha256.clone(),
             dictionary_sha256: self.dictionary_sha256.clone(),
-            published_table_bytes: self.published_table_bytes,
-            tables: self.tables.clone(),
+            tables: self
+                .tables
+                .iter()
+                .map(|(name, table)| (name.clone(), table.rows))
+                .collect(),
             batches: self.batches.clone(),
             postgres_version: self.postgres_version.clone(),
             postgres_settings: self.postgres_settings.clone(),
-            initial_lsn: self.initial_lsn.clone(),
         }
     }
     pub fn content_hash(&self) -> Result<String> {
@@ -513,6 +518,23 @@ mod tests {
         let mut b = a.clone();
         b.load_started_unix_ms += 50_000;
         b.load_finished_unix_ms += 50_000;
+        assert_eq!(a.content_hash().unwrap(), b.content_hash().unwrap());
+    }
+
+    #[test]
+    fn content_hash_excludes_load_position_and_physical_sizes() {
+        let a = fixture_manifest();
+        let mut b = a.clone();
+        // A second load of the same seed sees a different WAL position and
+        // potentially different physical page layout; the logical dataset is
+        // identical, so the content hash must be identical.
+        b.initial_lsn = Some("0/999999".into());
+        b.published_table_bytes += 8192;
+        if let Some(table) = b.tables.get_mut("tenants") {
+            table.table_bytes += 4096;
+            table.index_bytes += 512;
+            table.total_relation_bytes += 4608;
+        }
         assert_eq!(a.content_hash().unwrap(), b.content_hash().unwrap());
     }
     #[test]

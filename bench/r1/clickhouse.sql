@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS r1_tenants_raw
     _deleted UInt8
 )
 ENGINE = MergeTree
-ORDER BY (tenant_id, _version);
+ORDER BY (tenant_id, _version)
+SETTINGS non_replicated_deduplication_window = 1000000;
 
 CREATE TABLE IF NOT EXISTS r1_customers_raw
 (
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS r1_customers_raw
     _deleted UInt8
 )
 ENGINE = MergeTree
-ORDER BY (customer_id, _version);
+ORDER BY (customer_id, _version)
+SETTINGS non_replicated_deduplication_window = 1000000;
 
 CREATE TABLE IF NOT EXISTS r1_orders_raw
 (
@@ -54,7 +56,8 @@ CREATE TABLE IF NOT EXISTS r1_orders_raw
     _deleted UInt8
 )
 ENGINE = MergeTree
-ORDER BY (order_id, _version);
+ORDER BY (order_id, _version)
+SETTINGS non_replicated_deduplication_window = 1000000;
 
 CREATE TABLE IF NOT EXISTS r1_order_events_raw
 (
@@ -70,7 +73,8 @@ CREATE TABLE IF NOT EXISTS r1_order_events_raw
     _deleted UInt8
 )
 ENGINE = MergeTree
-ORDER BY (event_id, _version);
+ORDER BY (event_id, _version)
+SETTINGS non_replicated_deduplication_window = 1000000;
 
 CREATE TABLE IF NOT EXISTS r1_meta.applied_transactions
 (
@@ -79,4 +83,5 @@ CREATE TABLE IF NOT EXISTS r1_meta.applied_transactions
     applied_at DateTime
 )
 ENGINE = MergeTree
-ORDER BY operation_sha256;
+ORDER BY operation_sha256
+SETTINGS non_replicated_deduplication_window = 1000000;

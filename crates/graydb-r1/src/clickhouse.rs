@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 /// Marker table recording every applied transaction (operation hash + LSN).
 pub const APPLIED_TRANSACTIONS: &str = "r1_meta.applied_transactions";
-const DEDUP_WINDOW: &str = "1000000";
+/// Table-level `SETTINGS non_replicated_deduplication_window` lives in
+/// bench/r1/clickhouse.sql: ClickHouse 25.8 rejects it as a query-level
+/// setting, and the token window must be server-side for crash retry safety.
 const COMPACT_FORMAT: &str = "JSONCompactEachRowWithNamesAndTypes";
 
 /// Monotonic version for one row change: `(lsn << 32) | ordinal`, where `lsn`
@@ -215,7 +217,7 @@ impl ClickHouseSink {
     /// Runs DDL or other statement batches (bootstrap uses `bench/r1/clickhouse.sql`).
     pub async fn execute(&self, sql: &str) -> Result<()> {
         for statement in split_sql_statements(sql)? {
-            self.post(&[], statement).await?;
+            self.post(&[], &statement).await?;
         }
         Ok(())
     }
@@ -368,10 +370,6 @@ impl ClickHouseSink {
             }
             self.post(
                 &[
-                    (
-                        "non_replicated_deduplication_window",
-                        DEDUP_WINDOW.to_string(),
-                    ),
                     ("date_time_input_format", "best_effort".to_string()),
                     ("insert_deduplication_token", format!("{token_id}:{raw}")),
                 ],
@@ -389,16 +387,10 @@ impl ClickHouseSink {
              VALUES ('{escaped}', {lsn}, now())"
         );
         self.post(
-            &[
-                (
-                    "non_replicated_deduplication_window",
-                    DEDUP_WINDOW.to_string(),
-                ),
-                (
-                    "insert_deduplication_token",
-                    format!("{escaped}:{APPLIED_TRANSACTIONS}"),
-                ),
-            ],
+            &[(
+                "insert_deduplication_token",
+                format!("{escaped}:{APPLIED_TRANSACTIONS}"),
+            )],
             &body,
         )
         .await?;
@@ -414,12 +406,51 @@ impl ClickHouseSink {
     }
 }
 
-fn split_sql_statements(sql: &str) -> Result<Vec<&str>> {
+fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
+    // Strip `--` line comments first (outside quoted strings): comment text
+    // may contain semicolons, which would otherwise split comment-only
+    // fragments into statements that ClickHouse sees as "Empty query".
+    let mut filtered = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            filtered.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => {
+                quote = Some(character);
+                filtered.push(character);
+            }
+            '-' if characters.peek() == Some(&'-') => {
+                for skipped in characters.by_ref() {
+                    if skipped == '\n' {
+                        filtered.push('\n');
+                        break;
+                    }
+                }
+            }
+            other => filtered.push(other),
+        }
+    }
+    anyhow::ensure!(
+        quote.is_none(),
+        "unterminated quoted string in ClickHouse SQL"
+    );
     let mut statements = Vec::new();
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
-    for (index, character) in sql.char_indices() {
+    for (index, character) in filtered.char_indices() {
         if let Some(active_quote) = quote {
             if escaped {
                 escaped = false;
@@ -433,22 +464,18 @@ fn split_sql_statements(sql: &str) -> Result<Vec<&str>> {
         match character {
             '\'' | '"' | '`' => quote = Some(character),
             ';' => {
-                let statement = sql[start..index].trim();
+                let statement = filtered[start..index].trim();
                 if !statement.is_empty() {
-                    statements.push(statement);
+                    statements.push(statement.to_string());
                 }
                 start = index + character.len_utf8();
             }
             _ => {}
         }
     }
-    anyhow::ensure!(
-        quote.is_none(),
-        "unterminated quoted string in ClickHouse SQL"
-    );
-    let trailing = sql[start..].trim();
+    let trailing = filtered[start..].trim();
     if !trailing.is_empty() {
-        statements.push(trailing);
+        statements.push(trailing.to_string());
     }
     Ok(statements)
 }
@@ -969,7 +996,9 @@ mod tests {
         assert!(!ddl.contains("ReplacingMergeTree"), "{ddl}");
         for key in ["tenant_id", "customer_id", "order_id", "event_id"] {
             assert!(
-                ddl.contains(&format!("ENGINE = MergeTree\nORDER BY ({key}, _version);")),
+                ddl.contains(&format!(
+                    "ORDER BY ({key}, _version)\nSETTINGS non_replicated_deduplication_window = 1000000;"
+                )),
                 "missing immutable sort key for {key}:\n{ddl}"
             );
         }
