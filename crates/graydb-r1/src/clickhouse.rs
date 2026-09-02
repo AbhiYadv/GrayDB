@@ -714,6 +714,9 @@ impl EngineAdapter for ClickHouseAdapter {
         Ok(EngineStatus {
             kind: EngineKind::Clickhouse,
             healthy: status.healthy,
+            // The sink applies every received batch synchronously, so the
+            // receive position and the apply position are the same value.
+            received_lsn: status.applied_lsn,
             applied_lsn: status.applied_lsn,
             lag_ms: None,
         })

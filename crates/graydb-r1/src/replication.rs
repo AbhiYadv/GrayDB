@@ -14,7 +14,7 @@ use graydb_registry::{Op, TypedChange};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -563,6 +563,8 @@ pub struct ReplayMapEntry {
 pub struct ReplayMap {
     path: PathBuf,
     entries: Vec<ReplayMapEntry>,
+    /// Byte offset of the verified prefix of `replay-map.jsonl` (append-only).
+    loaded_bytes: u64,
 }
 
 impl ReplayMap {
@@ -573,6 +575,7 @@ impl ReplayMap {
         Ok(Self {
             path,
             entries: Vec::new(),
+            loaded_bytes: 0,
         })
     }
 
@@ -583,13 +586,62 @@ impl ReplayMap {
         let mut map = Self {
             path,
             entries: Vec::new(),
+            loaded_bytes: 0,
         };
-        for line in std::io::BufReader::new(std::fs::File::open(&map.path)?).lines() {
-            let entry = serde_json::from_str(&line?)?;
-            map.validate_next(&entry)?;
-            map.entries.push(entry);
-        }
+        map.refresh()?;
         Ok(map)
+    }
+
+    /// Incrementally loads replay-map lines appended since the last refresh.
+    /// A final line that is not yet newline-terminated is left for the next
+    /// refresh; an interior corrupt line is a hard error.
+    pub fn refresh(&mut self) -> Result<()> {
+        let mut file = std::fs::File::open(&self.path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < self.loaded_bytes {
+            return Err(anyhow!(
+                "replay map shrank from {} to {} bytes; append-only invariant broken",
+                self.loaded_bytes,
+                file_len
+            ));
+        }
+        if file_len == self.loaded_bytes {
+            return Ok(());
+        }
+        use std::io::{BufRead, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(self.loaded_bytes))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut consumed = self.loaded_bytes;
+        let mut line = String::new();
+        loop {
+            let line_start = consumed;
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            consumed += read as u64;
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let entry: ReplayMapEntry = match serde_json::from_str(trimmed) {
+                Ok(entry) => entry,
+                Err(error) if consumed >= file_len && !line.ends_with('\n') => {
+                    // Unterminated final line: the replayer has not finished
+                    // this append.  Leave it for the next refresh.  A corrupt
+                    // newline-terminated line stays a hard error.
+                    let _ = error;
+                    consumed = line_start;
+                    break;
+                }
+                Err(error) => return Err(error).context("replay map line is corrupt"),
+            };
+            self.validate_next(&entry)?;
+            self.entries.push(entry);
+        }
+        self.loaded_bytes = consumed;
+        Ok(())
     }
 
     pub fn push(&mut self, entry: ReplayMapEntry) -> Result<()> {
@@ -850,5 +902,34 @@ mod tests {
         assert_eq!(ReplayMap::resume(dir.path()).unwrap().entries().len(), 1);
         let contents = std::fs::read_to_string(dir.path().join("replay-map.jsonl")).unwrap();
         assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[test]
+    fn replay_map_refresh_loads_appended_entries() {
+        let dir = tempdir().unwrap();
+        let mut map = ReplayMap::create(dir.path()).unwrap();
+        map.push(ReplayMapEntry {
+            logical_sequence: 1,
+            original_source_lsn: 10,
+            replay_source_lsn: 20,
+            operation_sha256: "abc".into(),
+        })
+        .unwrap();
+        let mut cached = ReplayMap::resume(dir.path()).unwrap();
+
+        map.push(ReplayMapEntry {
+            logical_sequence: 2,
+            original_source_lsn: 30,
+            replay_source_lsn: 40,
+            operation_sha256: "def".into(),
+        })
+        .unwrap();
+
+        cached.refresh().unwrap();
+        assert_eq!(cached.entries().len(), 2);
+        assert_eq!(cached.entries()[1].replay_source_lsn, 40);
+        // No new lines: refresh is a no-op.
+        cached.refresh().unwrap();
+        assert_eq!(cached.entries().len(), 2);
     }
 }

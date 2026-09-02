@@ -147,6 +147,15 @@ impl R1RuntimeServices for FakeServices {
         })
     }
 
+    async fn query_freshness_ms(
+        &mut self,
+        _mode: RunMode,
+        _engine: EngineKind,
+        _visible_lsn: u64,
+    ) -> Result<Option<u64>> {
+        Ok(Some(5))
+    }
+
     async fn query(
         &mut self,
         engine: EngineKind,

@@ -389,6 +389,11 @@ where
     run_root: Option<PathBuf>,
     active_plan: Option<RunPlan>,
     clickhouse_cdc: Option<ClickHouseCdcTask>,
+    /// Incrementally refreshed read views of the append-only ledger and the
+    /// per-engine replay maps.  Refreshing O(new tail) per query iteration
+    /// keeps timed stages off an O(entire-file) rescan.
+    ledger_cache: Option<crate::ledger::CommittedLedger>,
+    replay_cache: Vec<(EngineKind, crate::replication::ReplayMap)>,
 }
 
 impl SystemR1RuntimeServices<SystemRuntimeProcess, TokioPostgresConnector, HttpEngines> {
@@ -430,11 +435,105 @@ where
             run_root: None,
             active_plan: None,
             clickhouse_cdc: None,
+            ledger_cache: None,
+            replay_cache: Vec::new(),
         }
     }
 
     fn service_root(run_root: &Path) -> PathBuf {
         run_root.join("services")
+    }
+
+    /// The run's committed ledger, incrementally refreshed.  Cached because
+    /// timed stages read it once per query attempt; a full re-read plus hash
+    /// verification of the entire file per attempt would starve the loop.
+    fn ledger(&mut self) -> Result<&mut crate::ledger::CommittedLedger> {
+        let run_root = self
+            .run_root
+            .as_deref()
+            .context("runtime stage did not bind its run root")?;
+        if self.ledger_cache.is_none() {
+            self.ledger_cache = Some(crate::ledger::CommittedLedger::resume(run_root)?);
+        }
+        let ledger = self
+            .ledger_cache
+            .as_mut()
+            .context("ledger cache disappeared")?;
+        ledger.refresh()?;
+        Ok(ledger)
+    }
+
+    /// The engine's replay map, incrementally refreshed; same caching rationale
+    /// as `ledger`.
+    fn replay_map(&mut self, engine: EngineKind) -> Result<&mut crate::replication::ReplayMap> {
+        let run_root = self
+            .run_root
+            .as_deref()
+            .context("runtime stage did not bind its run root")?;
+        if !self.replay_cache.iter().any(|(kind, _)| *kind == engine) {
+            let map = crate::replication::ReplayMap::resume(
+                run_root.join("isolated").join(engine_name(engine)),
+            )?;
+            self.replay_cache.push((engine, map));
+        }
+        let map = self
+            .replay_cache
+            .iter_mut()
+            .find(|(kind, _)| *kind == engine)
+            .map(|(_, map)| map)
+            .context("replay map cache disappeared")?;
+        map.refresh()?;
+        Ok(map)
+    }
+
+    /// Milliseconds since the source committed the newest state the engine
+    /// holds at `position`.  The committed ledger pairs every source LSN
+    /// with the wall-clock time PostgreSQL committed it, so the newest
+    /// ledger entry at or below the engine's visible position is the newest
+    /// source state the engine holds and its age is the replication
+    /// freshness in real milliseconds.  Binary search over the in-memory
+    /// Vec is O(log n) per call with no extra engine HTTP traffic.
+    fn freshness_at_position(
+        &mut self,
+        mode: RunMode,
+        engine: EngineKind,
+        position: u64,
+    ) -> Result<Option<u64>> {
+        let committed_unix_ms = match mode {
+            RunMode::Correctness => {
+                let ledger = self.ledger()?;
+                let entries = ledger.entries();
+                let index = entries.partition_point(|entry| entry.source_lsn <= position);
+                if index == 0 {
+                    return Ok(None);
+                }
+                entries[index - 1].committed_unix_ms
+            }
+            RunMode::Isolated => {
+                // `position` is a replay LSN: resolve it through the
+                // engine's replay map to its logical sequence, then to the
+                // source commit time.
+                let sequence = {
+                    let map = self.replay_map(engine)?;
+                    let entries = map.entries();
+                    let index =
+                        entries.partition_point(|entry| entry.replay_source_lsn <= position);
+                    if index == 0 {
+                        return Ok(None);
+                    }
+                    entries[index - 1].logical_sequence
+                };
+                let ledger = self.ledger()?;
+                let ledger_entries = ledger.entries();
+                let ledger_index =
+                    ledger_entries.partition_point(|entry| entry.sequence <= sequence);
+                if ledger_index == 0 {
+                    return Ok(None);
+                }
+                ledger_entries[ledger_index - 1].committed_unix_ms
+            }
+        };
+        Ok(Some(wall_unix_ms().saturating_sub(committed_unix_ms) as u64))
     }
 
     fn compose_request(
@@ -562,6 +661,16 @@ pub trait R1RuntimeServices: Send {
         mode: RunMode,
         engine: EngineKind,
     ) -> Result<LogicalCheckpoint>;
+    /// Milliseconds since the source committed the newest state the engine
+    /// had applied at `visible_lsn`.  `None` when the position predates the
+    /// ledger's first entry.  In isolated mode `visible_lsn` is a replay LSN
+    /// resolved through the engine's replay map.
+    async fn query_freshness_ms(
+        &mut self,
+        mode: RunMode,
+        engine: EngineKind,
+        visible_lsn: u64,
+    ) -> Result<Option<u64>>;
     async fn query(
         &mut self,
         engine: EngineKind,
@@ -597,6 +706,8 @@ where
         }
         self.run_root = Some(run_root.to_path_buf());
         self.active_plan = Some(plan.clone());
+        self.ledger_cache = None;
+        self.replay_cache.clear();
         Ok(())
     }
 
@@ -938,14 +1049,8 @@ where
         mode: RunMode,
         engine: EngineKind,
     ) -> Result<LogicalCheckpoint> {
-        let run_root = self
-            .run_root
-            .as_deref()
-            .context("runtime stage did not bind its run root")?;
         if mode == RunMode::Isolated {
-            let map = crate::replication::ReplayMap::resume(
-                run_root.join("isolated").join(engine_name(engine)),
-            )?;
+            let map = self.replay_map(engine)?;
             let entry = map
                 .entries()
                 .last()
@@ -955,7 +1060,7 @@ where
                 source_lsn: entry.replay_source_lsn,
             });
         }
-        let ledger = crate::ledger::CommittedLedger::resume(run_root)?;
+        let ledger = self.ledger()?;
         // Correctness checkpoints come from the committed ledger, not a fresh
         // WAL read: the ledger's last entry pairs the sequence with its
         // commit-end source LSN, is identical for every engine, and never
@@ -965,6 +1070,15 @@ where
             sequence: last.as_ref().map(|entry| entry.sequence).unwrap_or(0),
             source_lsn: last.as_ref().map(|entry| entry.source_lsn).unwrap_or(0),
         })
+    }
+
+    async fn query_freshness_ms(
+        &mut self,
+        mode: RunMode,
+        engine: EngineKind,
+        visible_lsn: u64,
+    ) -> Result<Option<u64>> {
+        self.freshness_at_position(mode, engine, visible_lsn)
     }
 
     async fn query(
@@ -982,40 +1096,57 @@ where
         let run_root = self
             .run_root
             .as_deref()
-            .context("runtime stage did not bind its run root")?;
+            .context("runtime stage did not bind its run root")?
+            .to_path_buf();
         let plan = self
             .active_plan
             .as_ref()
-            .context("runtime stage did not bind its run plan")?;
-        let current_rows = self.committed_rows(run_root).await?;
+            .context("runtime stage did not bind its run plan")?
+            .clone();
+        let current_rows = self.committed_rows(&run_root).await?;
         let source_lsn = self.current_source_lsn().await?;
-        let window = self
-            .rate_window
-            .as_mut()
-            .context("rate observation requested while writer is stopped")?;
-        anyhow::ensure!(
-            window.target_rows_per_sec == target_rows_per_sec,
-            "rate observation target differs from active writer rate"
-        );
-        let elapsed = window.started.elapsed().as_secs_f64().max(0.001);
+        // Snapshot the window under a short borrow; the engine status and
+        // freshness pass below needs &mut self.
+        let (elapsed, starting_rows, previous_backlog) = {
+            let window = self
+                .rate_window
+                .as_mut()
+                .context("rate observation requested while writer is stopped")?;
+            anyhow::ensure!(
+                window.target_rows_per_sec == target_rows_per_sec,
+                "rate observation target differs from active writer rate"
+            );
+            (
+                window.started.elapsed().as_secs_f64().max(0.001),
+                window.starting_rows,
+                window.previous_backlog,
+            )
+        };
         let achieved_rows_per_sec =
-            ((current_rows.saturating_sub(window.starting_rows) as f64) / elapsed).round() as u64;
+            ((current_rows.saturating_sub(starting_rows) as f64) / elapsed).round() as u64;
         let mut freshness_p99_ms = 0;
         let mut minimum_applied = source_lsn;
         let mut correctness_passed = true;
         for engine in &plan.engines {
             let status = self.engines.status(*engine).await?;
             correctness_passed &= status.healthy;
-            freshness_p99_ms = freshness_p99_ms.max(status.lag_ms.unwrap_or(0));
-            minimum_applied = minimum_applied.min(
-                status
-                    .applied_lsn
-                    .with_context(|| format!("{engine:?} status omitted applied LSN"))?,
-            );
+            // Real replication freshness from source commit times; the
+            // engine's lag_ms field is not populated by either adapter.
+            // The maximum across engines is a conservative upper bound for
+            // the bucket's p99.
+            let applied = status
+                .applied_lsn
+                .with_context(|| format!("{engine:?} status omitted applied LSN"))?;
+            if let Some(freshness_ms) = self.freshness_at_position(plan.mode, *engine, applied)? {
+                freshness_p99_ms = freshness_p99_ms.max(freshness_ms);
+            }
+            minimum_applied = minimum_applied.min(applied);
         }
         let backlog_bytes = source_lsn.saturating_sub(minimum_applied);
-        let backlog_growing = backlog_bytes > window.previous_backlog;
-        window.previous_backlog = backlog_bytes;
+        let backlog_growing = backlog_bytes > previous_backlog;
+        if let Some(window) = self.rate_window.as_mut() {
+            window.previous_backlog = backlog_bytes;
+        }
         Ok(RateSearchObservation {
             target_rows_per_sec,
             achieved_rows_per_sec,
@@ -1364,6 +1495,10 @@ where
                         if !failed {
                             digests.insert(digest.clone());
                         }
+                        let freshness_ms = self
+                            .services
+                            .query_freshness_ms(plan.mode, *engine, result.visible_lsn)
+                            .await?;
                         records.push(StageQueryRecord {
                             query: schedule.query,
                             engine: Some(*engine),
@@ -1375,6 +1510,7 @@ where
                             visible_lsn: result.visible_lsn,
                             canonical_digest: digest,
                             elapsed_ns: result.elapsed_ns,
+                            freshness_ms,
                             rows_read: result.rows_read,
                             bytes_read: result.bytes_read,
                             failed,
@@ -1393,6 +1529,7 @@ where
                         visible_lsn: 0,
                         canonical_digest: String::new(),
                         elapsed_ns: 0,
+                        freshness_ms: None,
                         rows_read: None,
                         bytes_read: None,
                         failed: true,
@@ -1837,6 +1974,13 @@ fn engine_name(engine: EngineKind) -> &'static str {
         EngineKind::Graydb => "graydb",
         EngineKind::Clickhouse => "clickhouse",
     }
+}
+
+fn wall_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn parse_postgres_url(url: &str) -> Result<(String, u16, String, String, String)> {
@@ -2621,10 +2765,10 @@ where
     }
 
     async fn received_lsn(&self, engine: EngineKind) -> Result<u64> {
-        self.engines
-            .status(engine)
-            .await?
-            .applied_lsn
+        let status = self.engines.status(engine).await?;
+        status
+            .received_lsn
+            .or(status.applied_lsn)
             .with_context(|| format!("{engine:?} status omitted received/applied LSN"))
     }
 
@@ -2795,6 +2939,10 @@ async fn start_clickhouse_cdc_task(
         let mut cdc = crate::clickhouse::ClickHouseCdcAdapter::new(clickhouse_url.clone());
         let mut applied_lsn = initial_lsn;
         let mut reconnect_started = None;
+        // One incrementally refreshed ledger read view for the whole CDC
+        // task: waiting per commit must not re-read and hash-verify the
+        // entire ledger file (O(commits squared) across a stage).
+        let mut ledger_view = crate::ledger::CommittedLedger::resume(&run_root)?;
         loop {
             let message = tokio::select! {
                 changed = stop_rx.changed() => {
@@ -2859,7 +3007,7 @@ async fn start_clickhouse_cdc_task(
                         .append(wal_start, lsn_end, commit_lsn.is_some(), payload.clone())
                         .await?;
                     let hash = match commit_lsn {
-                        Some(lsn) => wait_for_ledger_hash(&run_root, lsn).await?,
+                        Some(lsn) => wait_for_ledger_hash(&mut ledger_view, lsn).await?,
                         None => String::new(),
                     };
                     let frame = Frame {
@@ -2912,14 +3060,20 @@ fn pgoutput_commit_lsn(payload: &[u8]) -> Option<u64> {
         .then(|| u64::from_be_bytes(payload[10..18].try_into().expect("checked commit frame")))
 }
 
-async fn wait_for_ledger_hash(run_root: &Path, source_lsn: u64) -> Result<String> {
+async fn wait_for_ledger_hash(
+    ledger: &mut crate::ledger::CommittedLedger,
+    source_lsn: u64,
+) -> Result<String> {
     let started = Instant::now();
     loop {
-        let ledger = crate::ledger::CommittedLedger::resume(run_root)?;
-        if let Some(entry) = ledger
-            .entries()
-            .iter()
-            .find(|entry| entry.source_lsn == source_lsn)
+        ledger.refresh()?;
+        // Ledger source LSNs are monotonic, so the commit-end position is a
+        // binary search, not a linear scan.
+        let entries = ledger.entries();
+        let index = entries.partition_point(|entry| entry.source_lsn < source_lsn);
+        if let Some(entry) = entries
+            .get(index)
+            .filter(|entry| entry.source_lsn == source_lsn)
         {
             return Ok(entry.operation_sha256.clone());
         }
@@ -3051,15 +3205,7 @@ fn write_system_report(
         correctness,
         invalidations: reasons,
         query_latency,
-        freshness: crate::report::FreshnessEvidence {
-            // ponytail: p50/p95 need a per-query freshness series the stage
-            // mechanics do not record yet; p99 and sample count are real.
-            // Record the series in timed stages before filling these in.
-            p50_ms: 0,
-            p95_ms: 0,
-            p99_ms: latest_rate.freshness_p99_ms,
-            samples: rates.len() as u64,
-        },
+        freshness: freshness_evidence(&state),
         source_rate: crate::report::SourceRateEvidence {
             target_rows_per_sec: latest_rate.target_rows_per_sec,
             achieved_rows_per_sec: latest_rate.achieved_rows_per_sec,
@@ -3080,6 +3226,43 @@ fn write_system_report(
         ],
         ..RuntimeStageEvidence::default()
     })
+}
+
+/// Freshness percentiles over the per-query samples recorded by the timed
+/// stages.  The rate-search bucket maxima remain visible separately in the
+/// source-rate evidence; this is the per-query distribution the spec gates.
+fn freshness_evidence(state: &crate::controller::RunState) -> crate::report::FreshnessEvidence {
+    let mut samples: Vec<u64> = state
+        .stages
+        .values()
+        .flat_map(|record| record.query_records.iter())
+        .filter(|sample| !sample.failed)
+        .filter_map(|sample| sample.freshness_ms)
+        .collect();
+    samples.sort_unstable();
+    let percentile = |fraction: f64| -> u64 {
+        if samples.is_empty() {
+            return 0;
+        }
+        let index = ((samples.len() as f64) * fraction).ceil() as usize;
+        samples[(index.clamp(1, samples.len())) - 1]
+    };
+    let (p50_ms, p95_ms, p99_ms, samples_count) = if samples.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        (
+            percentile(0.50),
+            percentile(0.95),
+            percentile(0.99),
+            samples.len() as u64,
+        )
+    };
+    crate::report::FreshnessEvidence {
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        samples: samples_count,
+    }
 }
 
 fn load_rate_observations(run_root: &Path) -> Result<Vec<RateSearchObservation>> {
@@ -3106,4 +3289,130 @@ fn load_rate_observations(run_root: &Path) -> Result<Vec<RateSearchObservation>>
         }
     }
     Ok(observations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{ProfileSpec, ScaleProfile};
+    use crate::controller::{RunState, StageRecord};
+    use crate::ledger::{CommittedLedger, LedgerEntry};
+
+    fn ledger_entry(sequence: u64, source_lsn: u64, committed_unix_ms: u128) -> LedgerEntry {
+        LedgerEntry {
+            sequence,
+            xid: 9001,
+            source_lsn,
+            operation_sha256: format!("{sequence:064x}"),
+            committed_unix_ms,
+            previous_entry_sha256: String::new(),
+            entry_sha256: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn freshness_is_the_age_of_the_newest_applied_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = wall_unix_ms();
+        let mut ledger = CommittedLedger::create(dir.path()).unwrap();
+        let mut entry = ledger_entry(1, 101, now - 9_000);
+        ledger.append(entry).unwrap();
+        let previous = ledger.entries()[0].entry_sha256.clone();
+        entry = ledger_entry(2, 202, now - 5_000);
+        entry.previous_entry_sha256 = previous;
+        ledger.append(entry).unwrap();
+
+        let mut services = SystemR1RuntimeServices::from_env().unwrap();
+        let plan = RunPlan {
+            profile: ScaleProfile::MacSmoke,
+            spec: ProfileSpec {
+                minimum_bytes: 1,
+                repetitions: 1,
+                warmup_secs: 1,
+                quiet_secs: 1,
+                fixed_rate_secs: 1,
+                search_step_secs: 1,
+                maximum_rate: 2_000,
+            },
+            mode: RunMode::Correctness,
+            engines: vec![EngineKind::Graydb],
+            input_hashes: BTreeMap::new(),
+        };
+        services.bind_run(dir.path(), &plan).unwrap();
+
+        // Engine has applied through the tip: freshness is the tip commit's
+        // age (~5s), not a stale WAL-read artifact.
+        let fresh = services
+            .freshness_at_position(RunMode::Correctness, EngineKind::Graydb, 202)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (5_000..=6_000).contains(&fresh),
+            "expected ~5000ms, got {fresh}"
+        );
+
+        // Engine is between commits: freshness is the older commit's age.
+        let between = services
+            .freshness_at_position(RunMode::Correctness, EngineKind::Graydb, 150)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (9_000..=10_000).contains(&between),
+            "expected ~9000ms, got {between}"
+        );
+
+        // Engine predates the ledger: no freshness is knowable.
+        let before = services
+            .freshness_at_position(RunMode::Correctness, EngineKind::Graydb, 50)
+            .unwrap();
+        assert!(before.is_none());
+    }
+
+    fn sample_record(freshness_ms: Option<u64>, failed: bool) -> StageQueryRecord {
+        StageQueryRecord {
+            query: crate::query::QueryId::Q1,
+            engine: Some(EngineKind::Graydb),
+            target_rows_per_sec: None,
+            logical_checkpoint: 1,
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: Some(2),
+            target_lsn: 10,
+            visible_lsn: 10,
+            canonical_digest: "digest".into(),
+            elapsed_ns: 1,
+            freshness_ms,
+            rows_read: None,
+            bytes_read: None,
+            failed,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn freshness_evidence_computes_percentiles_from_query_samples() {
+        let mut state = RunState::new("freshness");
+        let mut record = StageRecord::default();
+        record.query_records = vec![
+            sample_record(Some(10), false),
+            sample_record(Some(20), false),
+            sample_record(Some(30), false),
+            sample_record(Some(99), true),
+            sample_record(None, false),
+        ];
+        state.stages.insert(RunStage::Warmup, record);
+        let evidence = freshness_evidence(&state);
+        assert_eq!(evidence.samples, 3);
+        assert_eq!(evidence.p50_ms, 20);
+        assert_eq!(evidence.p95_ms, 30);
+        assert_eq!(evidence.p99_ms, 30);
+    }
+
+    #[test]
+    fn freshness_evidence_is_empty_without_samples() {
+        let state = RunState::new("empty");
+        let evidence = freshness_evidence(&state);
+        assert_eq!(evidence.samples, 0);
+        assert_eq!(evidence.p50_ms, 0);
+        assert_eq!(evidence.p99_ms, 0);
+    }
 }

@@ -136,6 +136,11 @@ pub struct StageQueryRecord {
     pub visible_lsn: u64,
     pub canonical_digest: String,
     pub elapsed_ns: u128,
+    /// Milliseconds between the source commit of the newest state the engine
+    /// had applied at query time and now — the per-query replication lag that
+    /// feeds the freshness percentiles and the p99 stop rule.
+    #[serde(default)]
+    pub freshness_ms: Option<u64>,
     #[serde(default)]
     pub rows_read: Option<u64>,
     pub bytes_read: Option<u64>,

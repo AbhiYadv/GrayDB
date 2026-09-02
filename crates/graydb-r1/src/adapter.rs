@@ -27,6 +27,10 @@ pub struct QueryResult {
 pub struct EngineStatus {
     pub kind: EngineKind,
     pub healthy: bool,
+    /// LSN of the newest change the engine has received (GrayDB: frame-log
+    /// receipt position; ClickHouse: identical to `applied_lsn` because the
+    /// sink applies each batch synchronously).
+    pub received_lsn: Option<u64>,
     pub applied_lsn: Option<u64>,
     pub lag_ms: Option<u64>,
 }

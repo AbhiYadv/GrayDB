@@ -1,6 +1,6 @@
 use crate::workload::TransactionPlan;
 use crate::{Event, EventSink};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -82,6 +82,10 @@ impl IntentLog {
 pub struct CommittedLedger {
     dir: PathBuf,
     entries: Vec<LedgerEntry>,
+    /// Byte offset of the verified prefix of `workload-ledger.jsonl`.  The
+    /// file is append-only, so refresh() only parses and hash-verifies the
+    /// tail beyond this offset.
+    loaded_bytes: u64,
 }
 
 impl CommittedLedger {
@@ -92,6 +96,7 @@ impl CommittedLedger {
         Ok(Self {
             dir: dir.as_ref().to_path_buf(),
             entries: Vec::new(),
+            loaded_bytes: 0,
         })
     }
 
@@ -126,21 +131,72 @@ impl CommittedLedger {
         let mut ledger = Self {
             dir: dir.as_ref().to_path_buf(),
             entries: Vec::new(),
+            loaded_bytes: 0,
         };
-        let path = dir.as_ref().join("workload-ledger.jsonl");
+        ledger.refresh()?;
+        Ok(ledger)
+    }
+
+    /// Incrementally loads and hash-verifies ledger lines appended since the
+    /// last refresh.  A final line that is not yet newline-terminated (the
+    /// writer is mid-append) is left for the next refresh; a corrupt line in
+    /// the verified interior is a hard error.  ponytail: refresh is O(new
+    /// tail); a full reload path exists via resume() if the append-only
+    /// invariant is ever broken.
+    pub fn refresh(&mut self) -> Result<()> {
+        let path = self.dir.join("workload-ledger.jsonl");
         if !path.exists() {
-            return Ok(ledger);
+            return Ok(());
         }
-        for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
-            let entry: LedgerEntry = serde_json::from_str(&line?)?;
-            if entry.sequence != ledger.next_sequence() {
+        let mut file = std::fs::File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < self.loaded_bytes {
+            return Err(anyhow!(
+                "ledger file shrank from {} to {} bytes; append-only invariant broken",
+                self.loaded_bytes,
+                file_len
+            ));
+        }
+        if file_len == self.loaded_bytes {
+            return Ok(());
+        }
+        use std::io::{BufRead, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(self.loaded_bytes))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut consumed = self.loaded_bytes;
+        let mut line = String::new();
+        loop {
+            let line_start = consumed;
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            consumed += read as u64;
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let entry: LedgerEntry = match serde_json::from_str(trimmed) {
+                Ok(entry) => entry,
+                Err(error) if consumed >= file_len && !line.ends_with('\n') => {
+                    // Unterminated final line: the writer has not finished
+                    // this append.  Leave it for the next refresh.  A
+                    // corrupt newline-terminated line stays a hard error.
+                    let _ = error;
+                    consumed = line_start;
+                    break;
+                }
+                Err(error) => return Err(error).context("ledger line is corrupt"),
+            };
+            if entry.sequence != self.next_sequence() {
                 return Err(anyhow!("ledger gap or duplicate"));
             }
             if entry.entry_sha256 != entry_hash(&entry) {
                 return Err(anyhow!("ledger checksum mismatch"));
             }
             if entry.previous_entry_sha256
-                != ledger
+                != self
                     .entries
                     .last()
                     .map(|existing| existing.entry_sha256.clone())
@@ -148,9 +204,10 @@ impl CommittedLedger {
             {
                 return Err(anyhow!("ledger chain mismatch"));
             }
-            ledger.entries.push(entry);
+            self.entries.push(entry);
         }
-        Ok(ledger)
+        self.loaded_bytes = consumed;
+        Ok(())
     }
 
     pub fn classify(&self, plan: &TransactionPlan) -> CommitState {
@@ -261,5 +318,73 @@ mod tests {
         let mut committed_ledger = CommittedLedger::create(committed_dir.path()).unwrap();
         committed_ledger.append(committed).unwrap();
         assert_eq!(committed_ledger.classify(&pending), CommitState::Committed);
+    }
+
+    #[test]
+    fn refresh_loads_only_the_appended_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = CommittedLedger::create(dir.path()).unwrap();
+        ledger.append(fixture_entry(1, "")).unwrap();
+        let previous = ledger.entries()[0].entry_sha256.clone();
+        ledger.append(fixture_entry(2, &previous)).unwrap();
+
+        // A long-running consumer caches the ledger at two entries while the
+        // writer appends more.
+        let mut cached = CommittedLedger::resume(dir.path()).unwrap();
+        assert_eq!(cached.entries().len(), 2);
+
+        let mut writer = CommittedLedger::resume(dir.path()).unwrap();
+        let tip = writer.entries()[1].entry_sha256.clone();
+        writer.append(fixture_entry(3, &tip)).unwrap();
+
+        cached.refresh().unwrap();
+        assert_eq!(cached.entries().len(), 3);
+        assert_eq!(cached.next_sequence(), 4);
+        // No new lines: refresh is a no-op.
+        cached.refresh().unwrap();
+        assert_eq!(cached.entries().len(), 3);
+    }
+
+    #[test]
+    fn refresh_leaves_a_partial_final_line_for_the_next_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = CommittedLedger::create(dir.path()).unwrap();
+        ledger.append(fixture_entry(1, "")).unwrap();
+        let mut cached = CommittedLedger::resume(dir.path()).unwrap();
+
+        let writer = CommittedLedger::resume(dir.path()).unwrap();
+        let tip = writer.entries()[0].entry_sha256.clone();
+        let mut entry = fixture_entry(2, &tip);
+        entry.entry_sha256 = entry_hash(&entry);
+        let line = serde_json::to_string(&entry).unwrap();
+
+        // Writer is mid-append: half the JSON, no newline yet.
+        let path = dir.path().join("workload-ledger.jsonl");
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(line[..line.len() / 2].as_bytes()).unwrap();
+        cached.refresh().unwrap();
+        assert_eq!(cached.entries().len(), 1);
+
+        // The writer finishes the append.
+        file.write_all(line[line.len() / 2..].as_bytes()).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_data().unwrap();
+        cached.refresh().unwrap();
+        assert_eq!(cached.entries().len(), 2);
+        assert_eq!(cached.next_sequence(), 3);
+    }
+
+    #[test]
+    fn refresh_rejects_a_shrinking_ledger_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = CommittedLedger::create(dir.path()).unwrap();
+        ledger.append(fixture_entry(1, "")).unwrap();
+        let mut cached = CommittedLedger::resume(dir.path()).unwrap();
+        std::fs::write(dir.path().join("workload-ledger.jsonl"), b"").unwrap();
+        assert!(cached.refresh().is_err());
     }
 }

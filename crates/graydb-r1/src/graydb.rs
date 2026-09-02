@@ -133,11 +133,16 @@ impl EngineAdapter for GrayDbAdapter {
             .get("applied_lsn")
             .and_then(|v| v.as_str())
             .and_then(|s| parse_lsn(s).ok());
+        let received_lsn = status
+            .get("received_lsn")
+            .and_then(|v| v.as_str())
+            .and_then(|s| parse_lsn(s).ok());
         let lag_ms = status.get("lag_ms").and_then(|v| v.as_u64());
 
         Ok(EngineStatus {
             kind: EngineKind::Graydb,
             healthy,
+            received_lsn,
             applied_lsn,
             lag_ms,
         })
@@ -302,5 +307,25 @@ mod tests {
         let formatted = format_lsn(lsn);
         let parsed = parse_lsn(&formatted).unwrap();
         assert_eq!(parsed, lsn);
+    }
+
+    #[tokio::test]
+    async fn status_parses_received_and_applied_lsn() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "healthy": true,
+                "received_lsn": "A/42",
+                "applied_lsn": "A/43",
+                "lag_ms": 0
+            })))
+            .mount(&server)
+            .await;
+        let adapter = GrayDbAdapter::new(server.uri());
+        let status = adapter.status().await.unwrap();
+        assert_eq!(status.received_lsn, Some(0xA_0000_0042));
+        assert_eq!(status.applied_lsn, Some(0xA_0000_0043));
+        assert!(status.healthy);
     }
 }
