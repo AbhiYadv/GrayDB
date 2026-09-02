@@ -6,6 +6,9 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,6 +80,7 @@ pub struct Metrics {
     pub query: HashMap<QueryMetricKey, LatencySeries>,
     pub freshness: HashMap<FreshnessMetricKey, LatencySeries>,
     pub resources: Vec<ResourceSample>,
+    pub raw_samples: Vec<RawMetricSample>,
 }
 
 impl Metrics {
@@ -91,6 +95,124 @@ impl Metrics {
             .entry(key)
             .or_insert_with(|| LatencySeries::new(3).expect("valid histogram"))
             .record_micros(millis.saturating_mul(1_000))
+    }
+    pub fn write_raw_samples(&self, run_root: impl AsRef<Path>) -> Result<PathBuf> {
+        let directory = run_root.as_ref().join("metrics");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("metrics.jsonl");
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        for sample in &self.raw_samples {
+            serde_json::to_writer(&mut file, sample)?;
+            writeln!(file)?;
+        }
+        Ok(path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawMetricSample {
+    pub kind: String,
+    pub monotonic_ns: u128,
+    pub stage: Option<String>,
+    pub payload: Value,
+}
+impl RawMetricSample {
+    pub fn resource(sample: ResourceSample) -> Self {
+        Self {
+            kind: "docker_resource".into(),
+            monotonic_ns: sample.monotonic_ns,
+            stage: None,
+            payload: serde_json::to_value(sample).expect("resource serialization"),
+        }
+    }
+    pub fn boundary(sample: BoundarySample) -> Self {
+        Self {
+            kind: "stage_boundary".into(),
+            monotonic_ns: sample.monotonic_ns,
+            stage: Some(sample.stage.clone()),
+            payload: serde_json::to_value(sample).expect("boundary serialization"),
+        }
+    }
+}
+
+pub trait DockerStatsSource {
+    fn sample(&mut self) -> Result<Vec<String>>;
+}
+pub struct DockerStatsCollector<S> {
+    source: S,
+    interval: Duration,
+    clock: Instant,
+    pub sampler: ResourceSampler,
+}
+impl<S: DockerStatsSource> DockerStatsCollector<S> {
+    pub fn new(source: S, interval: Duration) -> Self {
+        Self {
+            source,
+            interval,
+            clock: Instant::now(),
+            sampler: ResourceSampler::new(),
+        }
+    }
+    pub fn once_per_second(source: S) -> Self {
+        Self::new(source, Duration::from_secs(1))
+    }
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+    pub fn collect_ticks(&mut self, ticks: usize) -> Result<Vec<ResourceSample>> {
+        let mut collected = Vec::new();
+        for _ in 0..ticks {
+            let monotonic_ns = self.clock.elapsed().as_nanos();
+            for line in self.source.sample()? {
+                let sample = ResourceSample::from_docker_stats_json(&line, monotonic_ns)?;
+                self.sampler.record(sample.clone());
+                collected.push(sample);
+            }
+            if !self.interval.is_zero() {
+                std::thread::sleep(self.interval);
+            }
+        }
+        Ok(collected)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundarySample {
+    pub stage: String,
+    pub monotonic_ns: u128,
+    pub clickhouse_async_metrics: Value,
+    pub graydb_status: Value,
+}
+pub trait ClickHouseMetricsSource {
+    fn async_metrics(&mut self) -> Result<Value>;
+}
+pub trait GrayDbStatusSource {
+    fn status(&mut self) -> Result<Value>;
+}
+pub struct StageBoundaryCollector<C, G> {
+    clickhouse: C,
+    graydb: G,
+    clock: Instant,
+}
+impl<C: ClickHouseMetricsSource, G: GrayDbStatusSource> StageBoundaryCollector<C, G> {
+    pub fn new(clickhouse: C, graydb: G) -> Self {
+        Self {
+            clickhouse,
+            graydb,
+            clock: Instant::now(),
+        }
+    }
+    pub fn capture(
+        &mut self,
+        stage: impl Into<String>,
+        monotonic_ns: u128,
+    ) -> Result<BoundarySample> {
+        Ok(BoundarySample {
+            stage: stage.into(),
+            monotonic_ns: monotonic_ns.max(self.clock.elapsed().as_nanos()),
+            clickhouse_async_metrics: self.clickhouse.async_metrics()?,
+            graydb_status: self.graydb.status()?,
+        })
     }
 }
 
@@ -252,5 +374,43 @@ mod tests {
         assert_eq!(sample.network_rx_bytes, 4_000);
         assert_eq!(sample.network_tx_bytes, 5_000_000);
         assert!(ResourceSample::from_docker_stats_json("not json", 42).is_err());
+    }
+
+    #[test]
+    fn collectors_capture_boundaries_and_append_raw_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sampler = DockerStatsCollector::new(FakeDocker, Duration::ZERO);
+        let raw = sampler.collect_ticks(2).unwrap();
+        assert_eq!(raw.len(), 2);
+        let mut boundary = StageBoundaryCollector::new(FakeClickHouse, FakeGrayDb);
+        let sample = boundary.capture("warmup", 7).unwrap();
+        assert_eq!(sample.stage, "warmup");
+        let mut metrics = Metrics::default();
+        metrics
+            .raw_samples
+            .extend(raw.into_iter().map(RawMetricSample::resource));
+        metrics.raw_samples.push(RawMetricSample::boundary(sample));
+        let path = metrics.write_raw_samples(dir.path()).unwrap();
+        assert!(path.ends_with("metrics/metrics.jsonl"));
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 3);
+    }
+
+    struct FakeDocker;
+    impl DockerStatsSource for FakeDocker {
+        fn sample(&mut self) -> Result<Vec<String>> {
+            Ok(vec![r#"{"Name":"graydb","CPUPerc":"1%"}"#.into()])
+        }
+    }
+    struct FakeClickHouse;
+    impl ClickHouseMetricsSource for FakeClickHouse {
+        fn async_metrics(&mut self) -> Result<Value> {
+            Ok(serde_json::json!({"Query": 3}))
+        }
+    }
+    struct FakeGrayDb;
+    impl GrayDbStatusSource for FakeGrayDb {
+        fn status(&mut self) -> Result<Value> {
+            Ok(serde_json::json!({"healthy": true}))
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Durable benchmark result and markdown report representations.
 
 use crate::contracts::ScaleProfile;
-use crate::metrics::{LatencySummary, ResourceSample, StageTiming};
+use crate::metrics::{LatencySummary, RawMetricSample, ResourceSample, StageTiming};
 use crate::oracle::CorrectnessVerdict;
 use crate::verdict::{CellVerdict, RunInvalidation, Scorecard, WinnerEvaluation};
 use anyhow::{Context, Result};
@@ -62,6 +62,7 @@ pub struct RunResult {
     pub scorecard: Option<Scorecard>,
     pub winner: Option<WinnerEvaluation>,
     pub resource_samples: Vec<ResourceSample>,
+    pub raw_metrics: Vec<RawMetricSample>,
     pub artifact_paths: Vec<String>,
 }
 
@@ -101,6 +102,15 @@ impl ReportWriter {
             result.dataset.bytes, result.dataset.rows
         ));
         out.push_str("## Correctness\n\n");
+        if let Some(correctness) = &result.correctness {
+            out.push_str(&format!(
+                "Correctness passed: {}\nDifferences: {}\n",
+                correctness.passed,
+                correctness.differences.len()
+            ));
+        } else {
+            out.push_str("Correctness passed: not recorded\nDifferences: 0\n");
+        }
         if result.valid {
             out.push_str("All correctness checks passed.\n\n");
         } else {
@@ -122,7 +132,19 @@ impl ReportWriter {
                 ));
             }
         }
-        out.push_str(&format!("\nFreshness p99: {} ms ({} samples)\n\nSource rate: {} rows/s achieved of {} target\n\nRecovery catch-up: {:?}\n\nCPU: {:.2}%\nMemory: {} bytes\nI/O: read {} bytes, write {} bytes\n\nStorage amplification: {:?}\n\nCell verdicts: {:?}\n", result.freshness.p99_ms, result.freshness.samples, result.source_rate.achieved_rows_per_sec, result.source_rate.target_rows_per_sec, result.recovery.catchup_ms, result.resources.cpu_percent, result.resources.memory_bytes, result.resources.block_read_bytes, result.resources.block_write_bytes, result.storage_amplification, result.cell_verdicts));
+        out.push_str(&format!("\nFreshness p50: {} ms\nFreshness p95: {} ms\nFreshness p99: {} ms\nFreshness samples: {}\n\nSource rate: {} rows/s achieved of {} target\n\nRecovery source_rows_while_down: {}\nRecovery catch-up: {:?}\n\nCPU: {:.2}%\nMemory: {} bytes\nI/O: read {} bytes, write {} bytes, network rx {} bytes, network tx {} bytes\n\nStorage amplification:\n", result.freshness.p50_ms, result.freshness.p95_ms, result.freshness.p99_ms, result.freshness.samples, result.source_rate.achieved_rows_per_sec, result.source_rate.target_rows_per_sec, result.recovery.source_rows_while_down, result.recovery.catchup_ms, result.resources.cpu_percent, result.resources.memory_bytes, result.resources.block_read_bytes, result.resources.block_write_bytes, result.resources.network_rx_bytes, result.resources.network_tx_bytes));
+        for (name, value) in &result.storage_amplification {
+            out.push_str(&format!("- Storage amplification: {name} = {value:.3}\n"));
+        }
+        out.push_str("\nCell verdicts:\n");
+        for (query, verdict) in &result.cell_verdicts {
+            out.push_str(&format!("- Cell verdict: {query} = {verdict:?}\n"));
+        }
+        if let Some(scorecard) = &result.scorecard {
+            out.push_str(&format!("\nAggregate p95 ratio: {:.4}\nAggregate churn ratio: {:.4}\nAggregate wins: {}\nAggregate losses: {}\nAggregate ties: {}\n", scorecard.geometric_p95_ratio, scorecard.churn_ratio, scorecard.wins(), scorecard.losses(), scorecard.ties()));
+        } else {
+            out.push_str("\nAggregate p95 ratio: n/a\nAggregate churn ratio: n/a\nAggregate wins: n/a\nAggregate losses: n/a\nAggregate ties: n/a\n");
+        }
         if result.valid {
             if let Some(winner) = &result.winner {
                 if winner.graydb_beat_clickhouse() {
@@ -148,6 +170,19 @@ impl ReportWriter {
             serde_json::to_vec_pretty(&AwsCapacityRequest::from_mac_result(result))?,
         )
         .context("writing aws-capacity-request.json")?;
+        if !result.raw_metrics.is_empty() {
+            let metrics_dir = root.join("metrics");
+            fs::create_dir_all(&metrics_dir)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(metrics_dir.join("metrics.jsonl"))?;
+            for sample in &result.raw_metrics {
+                serde_json::to_writer(&mut file, sample)?;
+                use std::io::Write;
+                writeln!(file)?;
+            }
+        }
         Ok(())
     }
     pub fn write(root: impl AsRef<Path>, result: &RunResult) -> Result<()> {
@@ -159,13 +194,19 @@ impl ReportWriter {
 pub struct AwsCapacityRequest {
     pub approved: bool,
     pub safety_factor: f64,
-    pub source_bytes: u64,
-    pub graydb_bytes: u64,
-    pub clickhouse_bytes: u64,
-    pub wal_bytes: u64,
-    pub temporary_bytes: u64,
-    pub artifact_bytes: u64,
-    pub total_bytes: u64,
+    pub measured_source_bytes: u64,
+    pub measured_graydb_bytes: u64,
+    pub measured_clickhouse_bytes: u64,
+    pub measured_wal_bytes: u64,
+    pub measured_temporary_bytes: u64,
+    pub measured_artifact_bytes: u64,
+    pub capacity_source_bytes: u64,
+    pub capacity_graydb_bytes: u64,
+    pub capacity_clickhouse_bytes: u64,
+    pub capacity_wal_bytes: u64,
+    pub capacity_temporary_bytes: u64,
+    pub capacity_artifact_bytes: u64,
+    pub recommended_total_bytes: u64,
 }
 impl AwsCapacityRequest {
     pub fn from_mac_result(result: &RunResult) -> Self {
@@ -180,26 +221,38 @@ impl AwsCapacityRequest {
         let source = result.dataset.bytes;
         let safety_factor = 1.35;
         let scaled = |bytes: u64| ((bytes as f64) * safety_factor).ceil() as u64;
-        let graydb = scaled((source as f64 * amp("graydb")).ceil() as u64);
-        let clickhouse = scaled((source as f64 * amp("clickhouse")).ceil() as u64);
-        let wal = scaled((source as f64 * amp("wal")).ceil() as u64);
-        let temporary = scaled((source as f64 * amp("temporary")).ceil() as u64);
-        let artifact = scaled((source as f64 * amp("artifact")).ceil() as u64);
+        let measured_graydb = (source as f64 * amp("graydb")).ceil() as u64;
+        let measured_clickhouse = (source as f64 * amp("clickhouse")).ceil() as u64;
+        let measured_wal = (source as f64 * amp("wal")).ceil() as u64;
+        let measured_temporary = (source as f64 * amp("temporary")).ceil() as u64;
+        let measured_artifact = (source as f64 * amp("artifact")).ceil() as u64;
+        let capacity_source = scaled(source);
+        let capacity_graydb = scaled(measured_graydb);
+        let capacity_clickhouse = scaled(measured_clickhouse);
+        let capacity_wal = scaled(measured_wal);
+        let capacity_temporary = scaled(measured_temporary);
+        let capacity_artifact = scaled(measured_artifact);
         Self {
             approved: false,
             safety_factor,
-            source_bytes: scaled(source),
-            graydb_bytes: graydb,
-            clickhouse_bytes: clickhouse,
-            wal_bytes: wal,
-            temporary_bytes: temporary,
-            artifact_bytes: artifact,
-            total_bytes: scaled(source)
-                .saturating_add(graydb)
-                .saturating_add(clickhouse)
-                .saturating_add(wal)
-                .saturating_add(temporary)
-                .saturating_add(artifact),
+            measured_source_bytes: source,
+            measured_graydb_bytes: measured_graydb,
+            measured_clickhouse_bytes: measured_clickhouse,
+            measured_wal_bytes: measured_wal,
+            measured_temporary_bytes: measured_temporary,
+            measured_artifact_bytes: measured_artifact,
+            capacity_source_bytes: capacity_source,
+            capacity_graydb_bytes: capacity_graydb,
+            capacity_clickhouse_bytes: capacity_clickhouse,
+            capacity_wal_bytes: capacity_wal,
+            capacity_temporary_bytes: capacity_temporary,
+            capacity_artifact_bytes: capacity_artifact,
+            recommended_total_bytes: capacity_source
+                .saturating_add(capacity_graydb)
+                .saturating_add(capacity_clickhouse)
+                .saturating_add(capacity_wal)
+                .saturating_add(capacity_temporary)
+                .saturating_add(capacity_artifact),
         }
     }
 }
@@ -225,5 +278,45 @@ mod tests {
         assert_eq!(result.metric_samples(), 0);
         assert_eq!(result.invalidations.len(), 1);
         assert!(result.winner.is_none());
+    }
+
+    #[test]
+    fn capacity_preserves_measured_bytes_and_scaled_recommendations() {
+        let mut result = RunResult::default();
+        result.dataset.bytes = 1_000;
+        result.storage_amplification.insert("graydb".into(), 2.0);
+        let request = AwsCapacityRequest::from_mac_result(&result);
+        assert_eq!(request.measured_graydb_bytes, 2_000);
+        assert_eq!(request.capacity_graydb_bytes, 2_700);
+        assert!(!request.approved);
+    }
+
+    #[test]
+    fn report_renders_all_required_evidence_labels() {
+        let mut result = RunResult::default();
+        result.valid = true;
+        result.freshness = FreshnessEvidence {
+            p50_ms: 1,
+            p95_ms: 2,
+            p99_ms: 3,
+            samples: 4,
+        };
+        result.recovery.source_rows_while_down = 8;
+        result.storage_amplification.insert("graydb".into(), 1.2);
+        result.cell_verdicts.insert("q1".into(), CellVerdict::Tie);
+        let report = ReportWriter::render_markdown(&result).unwrap();
+        for label in [
+            "Freshness p50",
+            "Freshness p95",
+            "Freshness p99",
+            "source_rows_while_down",
+            "Storage amplification: graydb",
+            "Cell verdict: q1",
+            "Correctness passed",
+            "Aggregate p95 ratio",
+            "Aggregate churn ratio",
+        ] {
+            assert!(report.contains(label), "missing {label}");
+        }
     }
 }

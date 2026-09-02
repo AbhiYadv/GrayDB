@@ -33,8 +33,8 @@ pub use manifest::{
     PUBLISHED_TABLE_BYTES_SQL,
 };
 pub use metrics::{
-    FreshnessMetricKey, LatencySeries, LatencySummary, Metrics, QueryMetricKey, ResourceSample,
-    ResourceSampler, StageTimer, StageTiming,
+    FreshnessMetricKey, LatencySeries, LatencySummary, Metrics, QueryMetricKey, RawMetricSample,
+    ResourceSample, ResourceSampler, StageTimer, StageTiming,
 };
 pub use oracle::{
     CapturedCheckpoint, CheckpointVerdictSink, CorrectnessVerdict, EngineCheckpointEvidence,
