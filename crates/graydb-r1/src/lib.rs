@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod artifacts;
+pub mod clickhouse;
 pub mod contracts;
 pub mod generator;
 pub mod graydb;
@@ -12,6 +13,10 @@ pub mod workload;
 
 pub use adapter::{EngineAdapter, EngineStatus, QueryInvocation, QueryResult};
 pub use artifacts::{sha256_tree, Event, EventLevel, EventRender, EventSink, RunDirectory};
+pub use clickhouse::{
+    ApplyOutcome, ClickHouseAdapter, ClickHouseSink, ClickHouseStatus, ReplicationAcknowledger,
+    Version,
+};
 pub use contracts::{
     EngineKind, LogicalCheckpoint, ProfileCatalog, ProfileSpec, RunConfig, RunMode, ScaleProfile,
 };
