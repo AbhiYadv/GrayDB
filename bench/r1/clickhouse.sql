@@ -1,7 +1,8 @@
 -- ClickHouse CDC representation for R1-P1-v1 (spec section 10). One immutable
 -- version row per PostgreSQL change; exact-at-LSN reads reduce to the greatest
--- _version with _source_lsn <= target before filtering tombstones. ReplacingMergeTree
--- keeps every version; no TTL or cleanup removes history during a run.
+-- _version with _source_lsn <= target before filtering tombstones. The complete
+-- version is part of every sorting key, so background merges cannot replace an
+-- older source version; no TTL or cleanup removes history during a run.
 
 CREATE DATABASE IF NOT EXISTS r1_meta;
 
@@ -17,8 +18,8 @@ CREATE TABLE IF NOT EXISTS r1_tenants_raw
     _version UInt128,
     _deleted UInt8
 )
-ENGINE = ReplacingMergeTree(_version)
-ORDER BY (tenant_id);
+ENGINE = MergeTree
+ORDER BY (tenant_id, _version);
 
 CREATE TABLE IF NOT EXISTS r1_customers_raw
 (
@@ -33,8 +34,8 @@ CREATE TABLE IF NOT EXISTS r1_customers_raw
     _version UInt128,
     _deleted UInt8
 )
-ENGINE = ReplacingMergeTree(_version)
-ORDER BY (customer_id);
+ENGINE = MergeTree
+ORDER BY (customer_id, _version);
 
 CREATE TABLE IF NOT EXISTS r1_orders_raw
 (
@@ -52,8 +53,8 @@ CREATE TABLE IF NOT EXISTS r1_orders_raw
     _version UInt128,
     _deleted UInt8
 )
-ENGINE = ReplacingMergeTree(_version)
-ORDER BY (order_id);
+ENGINE = MergeTree
+ORDER BY (order_id, _version);
 
 CREATE TABLE IF NOT EXISTS r1_order_events_raw
 (
@@ -68,8 +69,8 @@ CREATE TABLE IF NOT EXISTS r1_order_events_raw
     _version UInt128,
     _deleted UInt8
 )
-ENGINE = ReplacingMergeTree(_version)
-ORDER BY (event_id);
+ENGINE = MergeTree
+ORDER BY (event_id, _version);
 
 CREATE TABLE IF NOT EXISTS r1_meta.applied_transactions
 (

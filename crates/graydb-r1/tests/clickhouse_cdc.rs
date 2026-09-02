@@ -2,14 +2,22 @@
 //! the r1 Compose stack; PostgreSQL provides the real WAL LSN clock. Run with
 //! `cargo test -p graydb-r1 --test clickhouse_cdc -- --ignored --test-threads=1`.
 
-use graydb_r1::clickhouse::{ApplyOutcome, ClickHouseAdapter, ClickHouseSink};
+use anyhow::{Context, Result};
+use graydb_ingest::repl::{parse_lsn, ReplClient, ReplMsg};
+use graydb_log::Frame;
+use graydb_r1::clickhouse::{
+    ApplyOutcome, ClickHouseAdapter, ClickHouseCdcAdapter, ClickHouseSink,
+};
 use graydb_r1::EngineAdapter;
 use graydb_r1::{LogicalCheckpoint, QueryId, QueryInvocation, QueryParameters};
 use graydb_registry::pgoutput::TupleValue;
 use graydb_registry::{Op, TypedChange};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio_postgres::NoTls;
+
+const CLICKHOUSE_CDC_SLOT: &str = "graydb_r1_clickhouse_cdc_slot";
 
 /// The two tests share the ClickHouse tables, so they serialize here.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -54,6 +62,41 @@ async fn postgres_client() -> tokio_postgres::Client {
         .await
         .unwrap();
     client
+}
+
+fn replication_target(url: &str) -> Result<(String, u16, String, String, String)> {
+    let stripped = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .context("R1 PostgreSQL URL must use postgres:// or postgresql://")?;
+    let (credentials, address_and_database) = stripped
+        .split_once('@')
+        .context("R1 PostgreSQL URL must include user/password and host")?;
+    let (user, password) = credentials
+        .split_once(':')
+        .context("R1 PostgreSQL URL must include a password")?;
+    let (address, database) = address_and_database
+        .split_once('/')
+        .context("R1 PostgreSQL URL must include a database")?;
+    let (host, port) = match address.rsplit_once(':') {
+        Some((host, port)) => (
+            host.to_owned(),
+            port.parse().context("parsing PostgreSQL port")?,
+        ),
+        None => (address.to_owned(), 5432),
+    };
+    Ok((
+        host,
+        port,
+        user.to_owned(),
+        password.to_owned(),
+        database.split('?').next().unwrap_or(database).to_owned(),
+    ))
+}
+
+async fn application_repl(url: &str) -> Result<ReplClient> {
+    let (host, port, user, password, database) = replication_target(url)?;
+    ReplClient::connect(&host, port, &user, &password, &database).await
 }
 
 /// Commits a scratch transaction so the WAL advances, then reads the real
@@ -254,6 +297,100 @@ async fn initial_load_and_roundtrip_are_exact_at_every_target_lsn() {
         visible, "3",
         "two live orders plus the snapshot pair minus the delete"
     );
+
+    // The raw tables deliberately retain every immutable version. Force the
+    // strongest merge path and re-run a stale checkpoint after later updates
+    // and deletes have been applied; the old target must still be reconstructible.
+    sink.execute("OPTIMIZE TABLE r1_orders_raw FINAL")
+        .await
+        .unwrap();
+    assert_eq!(
+        q5_by_status(&adapter, lsn1).await,
+        vec![
+            ("paid".to_string(), 1, 100),
+            ("pending".to_string(), 1, 300),
+            ("shipped".to_string(), 1, 600),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the Task 11 PostgreSQL logical-replication and ClickHouse service environment"]
+async fn real_pgoutput_frames_are_buffered_until_commit_then_applied() -> Result<()> {
+    let _guard = SERIAL.lock().unwrap();
+    reset_clickhouse().await;
+    let url = std::env::var("GRAYDB_R1_POSTGRES_URL")
+        .expect("the r1 service environment supplies GRAYDB_R1_POSTGRES_URL");
+    let pg = postgres_client().await;
+    let order_id = 20_000_099_999_i64;
+    // Clean up before the replication slot's snapshot so the stream contains
+    // precisely the insert below, not a prior-run delete.
+    pg.execute("DELETE FROM r1.orders WHERE order_id = $1", &[&order_id])
+        .await?;
+    pg.query(
+        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+         WHERE slot_name = $1 AND NOT active",
+        &[&CLICKHOUSE_CDC_SLOT],
+    )
+    .await?;
+
+    let mut repl = application_repl(&url).await?;
+    let snapshot = repl.create_slot_with_snapshot(CLICKHOUSE_CDC_SLOT).await?;
+    let initial_lsn = parse_lsn(&snapshot.consistent_point)?;
+    repl.start_replication(CLICKHOUSE_CDC_SLOT, "graydb_r1_pub", initial_lsn)
+        .await?;
+
+    pg.execute(
+        "INSERT INTO r1.orders (order_id, tenant_id, customer_id, status, channel, amount_cents, created_at, updated_at, attributes) \
+         VALUES ($1, 101, 102, 'paid', 'web', 123, '2026-09-01 00:00:00+00', '2026-09-01 00:00:00+00', '{}'::jsonb)",
+        &[&order_id],
+    )
+    .await?;
+
+    let mut cdc = ClickHouseCdcAdapter::new(clickhouse_url());
+    let mut seq = 0_u64;
+    let applied = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match repl.next_replication_message().await? {
+                ReplMsg::XLogData { wal_start, payload } => {
+                    let frame = Frame {
+                        seq,
+                        lsn_start: wal_start,
+                        lsn_end: wal_start,
+                        txn_complete: false,
+                        payload,
+                    };
+                    seq += 1;
+                    if let Some(outcome) = cdc
+                        .apply_frames(&mut repl, &operation_hash("real-pgoutput-order"), &[frame])
+                        .await?
+                    {
+                        break Ok::<_, anyhow::Error>(outcome);
+                    }
+                }
+                ReplMsg::Keepalive {
+                    reply_requested: true,
+                    ..
+                } => repl.send_standby_status(initial_lsn, false).await?,
+                ReplMsg::Keepalive { .. } => {}
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for real pgoutput Commit")??;
+    assert_eq!(applied, ApplyOutcome::Applied);
+
+    let adapter = ClickHouseAdapter::new(clickhouse_url());
+    assert_eq!(
+        one_cell(
+            &adapter,
+            &format!("SELECT count() FROM r1_orders_raw WHERE order_id = {order_id}"),
+        )
+        .await,
+        "1"
+    );
+    repl.close().await?;
+    Ok(())
 }
 
 #[tokio::test]

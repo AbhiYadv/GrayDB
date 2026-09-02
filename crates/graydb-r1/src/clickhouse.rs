@@ -11,6 +11,8 @@ use crate::contracts::EngineKind;
 use crate::query::{QueryId, QueryParameters};
 use anyhow::{anyhow, bail, Context, Result};
 use graydb_ingest::repl::ReplClient;
+use graydb_log::Frame;
+use graydb_registry::decoder::StreamDecoder;
 use graydb_registry::pgoutput::TupleValue;
 use graydb_registry::{Op, TypedChange};
 use serde::{Deserialize, Serialize};
@@ -129,6 +131,77 @@ impl ReplicationAcknowledger for ReplClient {
 pub struct ClickHouseSink {
     client: reqwest::Client,
     base_url: String,
+}
+
+/// Production pgoutput boundary for ClickHouse CDC. It owns the incremental
+/// [`StreamDecoder`], so the sink receives only a complete decoder-emitted
+/// transaction in the exact frame order in which PostgreSQL published it.
+pub struct ClickHouseCdcAdapter {
+    sink: ClickHouseSink,
+    decoder: StreamDecoder,
+}
+
+impl ClickHouseCdcAdapter {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_sink(ClickHouseSink::new(base_url))
+    }
+
+    pub fn with_sink(sink: ClickHouseSink) -> Self {
+        Self {
+            sink,
+            decoder: StreamDecoder::new(),
+        }
+    }
+
+    /// Feeds raw, contiguous pgoutput frames. Frames before Commit only extend
+    /// the decoder buffer and perform no ClickHouse request. At Commit the
+    /// decoder supplies one ordered transaction with its commit-end LSN, which
+    /// is the sole input accepted by the sink and acknowledgement boundary.
+    ///
+    /// `operation_sha256` must be the control-stream operation hash associated
+    /// with this one expected application transaction. Supplying two commits in
+    /// one call is rejected so a hash can never be attached to the wrong commit.
+    pub async fn apply_frames<A: ReplicationAcknowledger + ?Sized>(
+        &mut self,
+        acknowledger: &mut A,
+        operation_sha256: &str,
+        frames: &[Frame],
+    ) -> Result<Option<ApplyOutcome>> {
+        let mut applied = None;
+        for frame in frames {
+            let batch = self.decoder.feed(std::slice::from_ref(frame))?;
+            if batch.txns == 0 {
+                anyhow::ensure!(
+                    batch.changes.is_empty(),
+                    "StreamDecoder emitted changes before transaction Commit"
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                batch.txns == 1 && batch.last_commit_lsn != 0,
+                "expected exactly one committed pgoutput transaction per frame"
+            );
+            anyhow::ensure!(
+                applied.is_none(),
+                "apply_frames accepts exactly one committed pgoutput transaction"
+            );
+            applied = Some(
+                self.sink
+                    .apply(
+                        acknowledger,
+                        batch.last_commit_lsn,
+                        operation_sha256,
+                        &batch.changes,
+                    )
+                    .await?,
+            );
+        }
+        Ok(applied)
+    }
+
+    pub fn abort_open_transaction(&mut self) {
+        self.decoder.abort_open_txn();
+    }
 }
 
 impl ClickHouseSink {
@@ -299,6 +372,7 @@ impl ClickHouseSink {
                         "non_replicated_deduplication_window",
                         DEDUP_WINDOW.to_string(),
                     ),
+                    ("date_time_input_format", "best_effort".to_string()),
                     ("insert_deduplication_token", format!("{token_id}:{raw}")),
                 ],
                 &body,
@@ -581,15 +655,15 @@ impl ClickHouseAdapter {
         Ok(Some(raw.parse().context("parsing applied LSN")?))
     }
 
-    /// Checkpoint invariant for the append-heavy event table. Tombstones are
-    /// excluded because an event delete intentionally creates a second physical
-    /// version for the same source key.
+    /// Checkpoint invariant for the physical event stream. Tombstones are part
+    /// of the stream: a retry that duplicates one must fail just as a duplicate
+    /// live event would.
     pub async fn verify_event_ids_unique(&self) -> Result<()> {
         let (body, _) = self
             .post(
                 &[],
                 "SELECT count(), uniqExact(event_id) \
-                 FROM r1_order_events_raw WHERE _deleted = 0 FORMAT TabSeparated",
+                 FROM r1_order_events_raw FORMAT TabSeparated",
             )
             .await?;
         let values: Vec<&str> = body.split_whitespace().collect();
@@ -598,13 +672,15 @@ impl ClickHouseAdapter {
             "event uniqueness query returned {} fields, expected 2",
             values.len()
         );
-        let rows: u64 = values[0].parse().context("parsing live event row count")?;
+        let rows: u64 = values[0]
+            .parse()
+            .context("parsing physical event row count")?;
         let unique: u64 = values[1]
             .parse()
             .context("parsing unique live event ID count")?;
         anyhow::ensure!(
             rows == unique,
-            "duplicate live event IDs at checkpoint: count()={rows}, uniqExact(event_id)={unique}"
+            "duplicate event IDs at checkpoint: count()={rows}, uniqExact(event_id)={unique}"
         );
         Ok(())
     }
@@ -719,6 +795,8 @@ impl EngineAdapter for ClickHouseAdapter {
 mod tests {
     use super::*;
     use crate::contracts::LogicalCheckpoint;
+    use bytes::{BufMut, Bytes};
+    use graydb_log::Frame;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
@@ -812,6 +890,85 @@ mod tests {
             op,
             new,
             old,
+        }
+    }
+
+    fn frame(seq: u64, lsn: u64, payload: Vec<u8>) -> Frame {
+        Frame {
+            seq,
+            lsn_start: lsn,
+            lsn_end: lsn,
+            txn_complete: false,
+            payload: Bytes::from(payload),
+        }
+    }
+
+    fn begin(xid: u32) -> Vec<u8> {
+        let mut bytes = vec![b'B'];
+        bytes.put_u64(0);
+        bytes.put_i64(0);
+        bytes.put_u32(xid);
+        bytes
+    }
+
+    fn commit(end_lsn: u64) -> Vec<u8> {
+        let mut bytes = vec![b'C'];
+        bytes.put_u8(0);
+        bytes.put_u64(end_lsn - 1);
+        bytes.put_u64(end_lsn);
+        bytes.put_i64(0);
+        bytes
+    }
+
+    fn orders_relation() -> Vec<u8> {
+        let fields = [
+            "order_id",
+            "tenant_id",
+            "customer_id",
+            "status",
+            "channel",
+            "amount_cents",
+            "created_at",
+            "updated_at",
+            "attributes",
+        ];
+        let mut bytes = vec![b'R'];
+        bytes.put_u32(42);
+        bytes.extend(b"r1\0orders\0");
+        bytes.put_u8(b'd');
+        bytes.put_u16(fields.len() as u16);
+        for field in fields {
+            bytes.put_u8(0);
+            bytes.extend(field.as_bytes());
+            bytes.put_u8(0);
+            bytes.put_u32(25);
+            bytes.put_i32(-1);
+        }
+        bytes
+    }
+
+    fn order_insert(values: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![b'I'];
+        bytes.put_u32(42);
+        bytes.put_u8(b'N');
+        bytes.put_u16(values.len() as u16);
+        for value in values {
+            bytes.put_u8(b't');
+            bytes.put_u32(value.len() as u32);
+            bytes.extend(value.as_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn raw_ddl_keeps_every_historical_version_as_a_distinct_sort_key() {
+        let ddl = include_str!("../../../bench/r1/clickhouse.sql");
+        assert!(!ddl.contains("ReplacingMergeTree"), "{ddl}");
+        for key in ["tenant_id", "customer_id", "order_id", "event_id"] {
+            assert!(
+                ddl.contains(&format!("ENGINE = MergeTree\nORDER BY ({key}, _version);")),
+                "missing immutable sort key for {key}:\n{ddl}"
+            );
         }
     }
 
@@ -1212,7 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_rejects_duplicate_live_event_ids_before_checkpoint_query() {
+    async fn adapter_rejects_duplicate_event_ids_before_checkpoint_query() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -1240,8 +1397,145 @@ mod tests {
         let adapter = ClickHouseAdapter::new(server.uri());
         let error = adapter.query(&invocation(500)).await.unwrap_err();
         assert!(
-            error.to_string().contains("duplicate live event IDs"),
+            error.to_string().contains("duplicate event IDs"),
             "error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_rejects_duplicate_tombstone_event_ids_in_the_physical_stream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains(
+                "max(source_lsn) FROM r1_meta.applied_transactions",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("500"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains("uniqExact(event_id)"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("4\t3\n"))
+            .mount(&server)
+            .await;
+
+        let adapter = ClickHouseAdapter::new(server.uri());
+        let error = adapter.query(&invocation(500)).await.unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate event IDs"),
+            "error: {error:#}"
+        );
+        let duplicate_check = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| String::from_utf8_lossy(&request.body).contains("uniqExact(event_id)"))
+            .expect("physical duplicate check request");
+        assert!(
+            !String::from_utf8_lossy(&duplicate_check.body).contains("_deleted = 0"),
+            "tombstones must participate in the physical duplicate invariant"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_frames_apply_only_after_commit_in_original_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains(MARKER_SELECT))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains(MARKER_SELECT))
+            .respond_with(ResponseTemplate::new(200).set_body_string(HASH_A))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains(ORDERS_INSERT))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains(MARKER_INSERT))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let frames = vec![
+            frame(0, 10, orders_relation()),
+            frame(1, 11, begin(77)),
+            frame(
+                2,
+                12,
+                order_insert(&[
+                    "1",
+                    "101",
+                    "102",
+                    "paid",
+                    "web",
+                    "100",
+                    "2026-09-01 00:00:00",
+                    "2026-09-01 00:00:01",
+                    "{}",
+                ]),
+            ),
+            frame(
+                3,
+                13,
+                order_insert(&[
+                    "2",
+                    "101",
+                    "102",
+                    "shipped",
+                    "web",
+                    "200",
+                    "2026-09-01 00:00:00",
+                    "2026-09-01 00:00:01",
+                    "{}",
+                ]),
+            ),
+            frame(4, 500, commit(500)),
+        ];
+        let mut cdc = ClickHouseCdcAdapter::new(server.uri());
+        let mut acknowledger = RecordingAcknowledger::default();
+        assert!(cdc
+            .apply_frames(&mut acknowledger, HASH_A, &frames[..4])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        assert_eq!(
+            cdc.apply_frames(&mut acknowledger, HASH_A, &frames[4..])
+                .await
+                .unwrap(),
+            Some(ApplyOutcome::Applied)
+        );
+        assert_eq!(acknowledger.lsns, vec![500]);
+        let data_insert = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| String::from_utf8_lossy(&request.body).contains(ORDERS_INSERT))
+            .expect("order batch inserted after commit");
+        let body = String::from_utf8(data_insert.body).unwrap();
+        assert!(body.contains("\"order_id\":\"1\""), "{body}");
+        assert!(
+            body.contains("\"change_ordinal\":1") || body.contains("\"_change_ordinal\":1"),
+            "{body}"
+        );
+        assert!(body.contains("\"_change_ordinal\":2"), "{body}");
+        assert!(
+            body.find("\"order_id\":\"1\"").unwrap() < body.find("\"order_id\":\"2\"").unwrap(),
+            "{body}"
         );
     }
 }
