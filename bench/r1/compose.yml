@@ -13,6 +13,8 @@ services:
       - max_replication_slots=16
       - -c
       - max_wal_senders=16
+      - -c
+      - hba_file=/etc/postgres/pg_hba.conf
     environment:
       POSTGRES_DB: r1
       POSTGRES_USER: r1
@@ -21,6 +23,7 @@ services:
       - "127.0.0.1:55432:5432"
     volumes:
       - "${R1_DATA_ROOT}/postgres:/var/lib/postgresql/data"
+      - "./postgres/pg_hba.conf:/etc/postgres/pg_hba.conf:ro"
     healthcheck:
       test: ["CMD-SHELL", "psql -U r1 -d r1 -tAc 'SELECT 1' | grep -qx 1"]
       interval: 2s

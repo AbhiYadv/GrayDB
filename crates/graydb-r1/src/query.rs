@@ -77,13 +77,11 @@ pub struct QueryResult {
 pub fn canonical_digest(result: &QueryResult) -> String {
     let order = canonical_column_order(&result.columns);
     let mut encoded = Vec::new();
-    for &index in &order {
-        let column = &result.columns[index];
-        encoded.extend_from_slice(column.len().to_string().as_bytes());
-        encoded.push(b':');
-        encoded.extend_from_slice(column.as_bytes());
-        encoded.push(b';');
-    }
+    // Column NAMES are deliberately excluded: engines name derived columns
+    // differently ("count" vs "count(*)" vs "count()"), and the digest
+    // compares result VALUES in the declared output order.  Empty result
+    // sets therefore hash identically across engines regardless of whether
+    // the transport reports a schema header.
     let mut rows: Vec<Vec<u8>> = result
         .rows
         .iter()
@@ -116,21 +114,12 @@ pub fn canonical_digest(result: &QueryResult) -> String {
     encode_hex(&h.finalize())
 }
 fn canonical_column_order(columns: &[String]) -> Vec<usize> {
-    let mut indexes: Vec<usize> = (0..columns.len()).collect();
-    indexes.sort_by_key(|&i| {
-        let rank = match columns[i].as_str() {
-            "customer_id" => 0,
-            "region" => 0,
-            "status" => 0,
-            "event_type" => 0,
-            "channel" => 1,
-            "sum(amount_cents)" | "revenue_cents" => 3,
-            "count" | "count(*)" | "order_count" => 4,
-            _ => 100,
-        };
-        (rank, columns[i].clone(), i)
-    });
-    indexes
+    // The declared (SELECT) order is the canonical order: the frozen query
+    // files declare identical column sequences for every engine, while
+    // derived column NAMES differ per engine ("count" vs "count(*)"), so no
+    // name-based reordering can be stable across engines.
+    let _ = columns;
+    (0..columns.len()).collect()
 }
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -186,22 +175,49 @@ mod tests {
         assert_ne!(canonical_digest(&a), canonical_digest(&c));
     }
     #[test]
-    fn digest_normalizes_column_order_but_not_column_identity() {
+    fn digest_uses_declared_order_and_ignores_column_identity() {
         let a = QueryResult {
             columns: vec!["tenant_id".into(), "status".into()],
             rows: vec![vec![Some("42".into()), Some("paid".into())]],
         };
+        // Column names are excluded: engines name derived columns differently.
+        let renamed = QueryResult {
+            columns: vec!["tenant_id".into(), "renamed_status".into()],
+            rows: vec![vec![Some("42".into()), Some("paid".into())]],
+        };
+        assert_eq!(canonical_digest(&a), canonical_digest(&renamed));
+
+        // Values are hashed in the DECLARED order: permuting the declaration
+        // permutes the digest, because the frozen query files declare
+        // identical sequences and the permutation is not a common form.
         let b = QueryResult {
             columns: vec!["status".into(), "tenant_id".into()],
             rows: vec![vec![Some("paid".into()), Some("42".into())]],
         };
-        assert_eq!(canonical_digest(&a), canonical_digest(&b));
+        assert_ne!(canonical_digest(&a), canonical_digest(&b));
 
-        let c = QueryResult {
-            columns: vec!["tenant_id".into(), "channel".into()],
-            rows: vec![vec![Some("42".into()), Some("paid".into())]],
+        let d = QueryResult {
+            columns: vec!["tenant_id".into(), "status".into()],
+            rows: vec![vec![Some("42".into()), Some("unpaid".into())]],
         };
-        assert_ne!(canonical_digest(&a), canonical_digest(&c));
+        assert_ne!(canonical_digest(&a), canonical_digest(&d));
+
+        // Row order never affects the digest.
+        let e = QueryResult {
+            columns: vec!["tenant_id".into(), "status".into()],
+            rows: vec![
+                vec![Some("7".into()), Some("paid".into())],
+                vec![Some("42".into()), Some("paid".into())],
+            ],
+        };
+        let f = QueryResult {
+            columns: vec!["tenant_id".into(), "status".into()],
+            rows: vec![
+                vec![Some("42".into()), Some("paid".into())],
+                vec![Some("7".into()), Some("paid".into())],
+            ],
+        };
+        assert_eq!(canonical_digest(&e), canonical_digest(&f));
     }
     #[test]
     fn digest_normalizes_declared_columns_and_cells() {
@@ -209,14 +225,23 @@ mod tests {
             columns: vec!["status".into(), "count".into()],
             rows: vec![vec![Some("paid".into()), Some("7".into())]],
         };
-        let b = QueryResult {
-            columns: vec!["count".into(), "status".into()],
-            rows: vec![vec![Some("7".into()), Some("paid".into())]],
+        // Engines that report no schema header for empty results and engines
+        // that do must still agree on the empty digest.
+        let empty_with_columns = QueryResult {
+            columns: vec!["status".into(), "count".into()],
+            rows: Vec::new(),
         };
-        assert_eq!(canonical_digest(&a), canonical_digest(&b));
+        let empty_without_columns = QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        };
+        assert_eq!(
+            canonical_digest(&empty_with_columns),
+            canonical_digest(&empty_without_columns)
+        );
         let c = QueryResult {
-            columns: vec!["status".into(), "unknown".into()],
-            rows: vec![vec![Some("paid".into()), Some("7".into())]],
+            columns: vec!["status".into(), "count".into()],
+            rows: vec![vec![Some("paid".into()), Some("8".into())]],
         };
         assert_ne!(canonical_digest(&a), canonical_digest(&c));
     }

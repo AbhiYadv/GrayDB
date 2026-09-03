@@ -39,7 +39,9 @@ pub use failure::{
     FailureEvidence, FailureRunner, FailureSequenceResult, FailureWorkload, SystemComposeControl,
     CATCHUP_TIMEOUT, CDC_OUTAGE, CONTROLLER_RESTART_EXIT_CODE, ENGINE_OUTAGE, WRITER_OUTAGE,
 };
-pub use generator::{CopyBatch, DeterministicGenerator, Row, Table};
+pub use generator::{
+    single_cycle_ranges, CopyBatch, DeterministicGenerator, Row, Table, TableRange,
+};
 pub use graydb::GrayDbAdapter;
 pub use ledger::{CommitState, CommittedLedger, IntentLog, LedgerEntry};
 pub use manifest::{

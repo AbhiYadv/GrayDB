@@ -242,6 +242,13 @@ fn collect_files(root: &Path, current: &Path, out: &mut Vec<(PathBuf, PathBuf)>)
             .strip_prefix(root)
             .map(Path::to_path_buf)
             .map_err(|_| anyhow!("path {} is outside {}", path.display(), root.display()))?;
+        // Service-owned live state (Compose bind mounts under services/) is
+        // not benchmark evidence: it changes under the running databases and
+        // contains database internals that are neither files to hash nor
+        // artifacts to archive.
+        if relative.starts_with("services") {
+            continue;
+        }
         if matches!(
             relative.file_name().and_then(|name| name.to_str()),
             Some("run.lock" | "SHA256SUMS")

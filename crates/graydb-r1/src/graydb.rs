@@ -90,6 +90,23 @@ impl GrayDbAdapter {
                 }
             }
 
+            // Drained-stream visibility proof: the engine has received every
+            // WAL byte through `received_lsn` (>= target) and holds zero
+            // undecoded frames.  Between publication commits, applied_lsn
+            // parks at the last commit while pg_current_wal_lsn() keeps
+            // advancing on non-published WAL (ANALYZE, autovacuum); at that
+            // point the engine is provably visible at the target because
+            // there is nothing left to apply.
+            let received_ok = status
+                .get("received_lsn")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_lsn(s).ok())
+                .is_some_and(|received| received >= target_lsn);
+            let drained = status.get("frames").and_then(|v| v.as_u64()) == Some(0);
+            if received_ok && drained {
+                return Ok(start.elapsed());
+            }
+
             tokio::time::sleep(interval).await;
         }
     }

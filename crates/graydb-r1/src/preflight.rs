@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -264,7 +263,12 @@ impl PreflightProbe for SystemPreflightProbe {
                 canonical_data_root.display()
             )
         })?;
-        let lock_available = probe_run_lock(run_root)?;
+        // The controller holds the exclusive run.lock for its whole lifetime
+        // (RunDirectory::create/resume is the authoritative gate and hard-
+        // fails on contention), so probing the lock from inside a stage
+        // would always collide with our own process.  Reaching this code at
+        // all proves the lock is held.
+        let lock_available = true;
         let write_probe = self.probe_write_sync(run_root)?;
 
         let colima_status = self.run_json_command("colima status --profile r1 --json", {
@@ -309,23 +313,6 @@ impl PreflightProbe for SystemPreflightProbe {
             colima_disk_bytes: probe_result.resources.colima_disk_bytes,
             lock_available,
         })
-    }
-}
-
-fn probe_run_lock(run_root: &Path) -> Result<bool> {
-    let lock_path = run_root.join("run.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    match lock.try_lock_exclusive() {
-        Ok(()) => {
-            lock.unlock().context("unlocking run.lock")?;
-            Ok(true)
-        }
-        Err(_) => Ok(false),
     }
 }
 

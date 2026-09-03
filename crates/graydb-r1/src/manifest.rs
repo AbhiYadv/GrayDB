@@ -1,4 +1,4 @@
-use crate::generator::cycle_ranges;
+use crate::generator::single_cycle_ranges;
 use crate::{CopyBatch, DeterministicGenerator, Event, EventSink, RunDirectory, Table};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -311,11 +311,18 @@ where
         let mut batches = Vec::new();
         let mut tables = BTreeMap::new();
         let mut analyze_ms = 0;
+        // A seed cycle is only 86 rows, and the size probe runs ANALYZE over
+        // all four published tables.  Measuring (and ANALYZEing) every cycle
+        // made the load ANALYZE-bound at ~one cycle per second.  Measure on
+        // a bytes-generated cadence instead: roughly sixteen probes per load,
+        // so the measured threshold still gates the stop without dominating
+        // the runtime.  ponytail: interval scales off minimum_bytes; a fixed
+        // MiB cadence plus a wall-clock guard is the upgrade if probe cost
+        // ever depends on table size super-linearly.
+        let measure_interval_bytes = (minimum_bytes / 16).max(1);
+        let mut unmeasured_bytes = 0u64;
         for cycle in 1.. {
-            for range in cycle_ranges(cycle)
-                .into_iter()
-                .skip((cycle as usize - 1) * 4)
-            {
+            for range in single_cycle_ranges(cycle - 1) {
                 let generated_at = Instant::now();
                 let generated = self.generator.copy_batches(range.table, range.range)?;
                 generation_ms += generated_at.elapsed().as_millis();
@@ -323,6 +330,7 @@ where
                     let copied_at = Instant::now();
                     self.sink.copy(&batch).await?;
                     copy_ms += copied_at.elapsed().as_millis();
+                    unmeasured_bytes += batch.bytes.len() as u64;
                     let entry = tables.entry(table_name(batch.table).to_string()).or_insert(
                         TableManifest {
                             rows: 0,
@@ -340,6 +348,10 @@ where
                     });
                 }
             }
+            if unmeasured_bytes < measure_interval_bytes {
+                continue;
+            }
+            unmeasured_bytes = 0;
             let analyzed_at = Instant::now();
             // Concrete PostgreSQL sinks run ANALYZE before their probe; keeping it
             // out of this generic seam makes the measured loop service-testable.

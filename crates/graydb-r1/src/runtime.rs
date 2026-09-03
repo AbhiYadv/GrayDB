@@ -837,7 +837,9 @@ where
                 "--username".into(),
                 self.config.postgres_user.clone(),
                 "--dbname".into(),
-                self.config.postgres_database.clone(),
+                // pg_basebackup parses --dbname as a conninfo string; a bare
+                // database name fails with 'missing "=" after ...'.
+                format!("dbname={}", self.config.postgres_database.clone()),
                 "--pgdata".into(),
                 destination.display().to_string(),
                 "--checkpoint=fast".into(),
@@ -1412,6 +1414,7 @@ where
         let mut records = Vec::new();
         let mut rates = Vec::new();
         let mut ordinal = 0_u64;
+        let mut pending_target: Option<LogicalCheckpoint> = None;
 
         while self.clock.elapsed() < maximum_end {
             let now = self.clock.elapsed();
@@ -1453,7 +1456,19 @@ where
             }
 
             ordinal += 1;
-            let checkpoints = self.checkpoints(plan).await?;
+            // Correctness mode queries a settle watermark, not the freshest
+            // ledger tip: while the writer runs, the tip advances every loop
+            // and the engines' replication lag (measured separately as
+            // freshness) would make every proof fail structurally.  Hold one
+            // target until both engines prove visible at it, then advance.
+            let checkpoints = match pending_target.take() {
+                Some(pending) if plan.mode == RunMode::Correctness => plan
+                    .engines
+                    .iter()
+                    .map(|engine| (*engine, pending))
+                    .collect(),
+                _ => self.checkpoints(plan).await?,
+            };
             let logical = checkpoints
                 .iter()
                 .map(|(_, checkpoint)| checkpoint)
@@ -1470,6 +1485,7 @@ where
             };
             let schedule = QuerySchedule::new(20_260_901).at(ordinal, schedule_checkpoint);
             let mut digests = BTreeSet::new();
+            let mut all_proved = true;
             for engine in &plan.engines {
                 let checkpoint = checkpoints
                     .iter()
@@ -1494,6 +1510,8 @@ where
                             || result.visible_lsn < checkpoint.source_lsn;
                         if !failed {
                             digests.insert(digest.clone());
+                        } else {
+                            all_proved = false;
                         }
                         let freshness_ms = self
                             .services
@@ -1518,24 +1536,32 @@ where
                                 .then(|| "engine returned stale or mismatched LSN proof".into()),
                         });
                     }
-                    Err(error) => records.push(StageQueryRecord {
-                        query: schedule.query,
-                        engine: Some(*engine),
-                        target_rows_per_sec: writer_rate,
-                        logical_checkpoint: checkpoint.sequence,
-                        started_at_unix_ms: query_started,
-                        completed_at_unix_ms: Some(self.clock.unix_ms()),
-                        target_lsn: checkpoint.source_lsn,
-                        visible_lsn: 0,
-                        canonical_digest: String::new(),
-                        elapsed_ns: 0,
-                        freshness_ms: None,
-                        rows_read: None,
-                        bytes_read: None,
-                        failed: true,
-                        failure: Some(format!("{error:#}")),
-                    }),
+                    Err(error) => {
+                        all_proved = false;
+                        records.push(StageQueryRecord {
+                            query: schedule.query,
+                            engine: Some(*engine),
+                            target_rows_per_sec: writer_rate,
+                            logical_checkpoint: checkpoint.sequence,
+                            started_at_unix_ms: query_started,
+                            completed_at_unix_ms: Some(self.clock.unix_ms()),
+                            target_lsn: checkpoint.source_lsn,
+                            visible_lsn: 0,
+                            canonical_digest: String::new(),
+                            elapsed_ns: 0,
+                            freshness_ms: None,
+                            rows_read: None,
+                            bytes_read: None,
+                            failed: true,
+                            failure: Some(format!("{error:#}")),
+                        });
+                    }
                 }
+            }
+            // Both engines proved visible at the watermark: release it so the
+            // next loop advances to a fresher ledger tip.
+            if plan.mode == RunMode::Correctness {
+                pending_target = if all_proved { None } else { Some(logical) };
             }
             if plan.mode == RunMode::Correctness && digests.len() > 1 {
                 let artifacts = persist_timed_evidence(root, stage, &records, &rates)?;
@@ -1826,14 +1852,6 @@ impl RuntimeEngines for HttpEngines {
             );
             return Ok(());
         }
-        let connection = format!(
-            "'{}:{}','{}','{{table}}','{}','{}'",
-            sql_literal(postgres_host),
-            postgres_port,
-            sql_literal(postgres_database),
-            sql_literal(postgres_user),
-            sql_literal(postgres_password)
-        );
         let version = (u128::from(source_lsn)) << 32;
         let statements = [
             (
@@ -1859,7 +1877,22 @@ impl RuntimeEngines for HttpEngines {
         ];
         let sink = crate::clickhouse::ClickHouseSink::new(self.clickhouse_url.clone());
         for (target, source, columns) in statements {
-            let source_fn = format!("postgresql({})", connection.replace("{table}", source));
+            // The PostgreSQL table function's third argument is the remote
+            // database and its sixth is the remote schema; without the
+            // schema it searches `public` and reports the table missing.
+            let (schema, table) = source
+                .split_once('.')
+                .context("snapshot source must be schema-qualified")?;
+            let source_fn = format!(
+                "postgresql('{}:{}','{}','{}','{}','{}','{}')",
+                sql_literal(postgres_host),
+                postgres_port,
+                sql_literal(postgres_database),
+                sql_literal(table),
+                sql_literal(postgres_user),
+                sql_literal(postgres_password),
+                sql_literal(schema),
+            );
             sink.execute(&format!(
                 "INSERT INTO {target} SELECT {columns}, {source_lsn}, 0, toUInt128({version}), 0 FROM {source_fn}"
             ))
@@ -2593,6 +2626,28 @@ where
     let captured =
         crate::oracle::PostgresCheckpoint::capture_source(&mut client, &writer_control, &params)
             .await?;
+    // The captured pg_current_wal_lsn() can sit BELOW an engine's snapshot
+    // boundary: GrayDB's slot consistent_point (lsn0) may be a few hundred
+    // bytes ahead, and its snapshot rows are tagged at lsn0 — an exact-at-LSN
+    // scan at the raw capture LSN would filter out every row.  With the
+    // writer paused and both streams drained, no published change exists
+    // between the capture position and any engine's applied position, so the
+    // greatest applied boundary is a sound common checkpoint LSN.
+    let mut source_lsn = captured.source_lsn;
+    for engine in &plan.engines {
+        if let Some(applied) = engines
+            .status(*engine)
+            .await
+            .ok()
+            .and_then(|status| status.applied_lsn)
+        {
+            source_lsn = source_lsn.max(applied);
+        }
+    }
+    let captured = crate::oracle::CapturedCheckpoint {
+        source_lsn,
+        ..captured
+    };
     let checkpoint = LogicalCheckpoint {
         sequence,
         source_lsn: captured.source_lsn,
@@ -2932,6 +2987,7 @@ async fn start_clickhouse_cdc_task(
     let run_root = run_root.to_path_buf();
     let (stop, mut stop_rx) = watch::channel(false);
     let join = tokio::spawn(async move {
+        let outcome = async {
         use graydb_ingest::repl::{ReplClient, ReplMsg};
         use graydb_log::{Frame, FrameLog};
         let mut frame_log =
@@ -2943,6 +2999,7 @@ async fn start_clickhouse_cdc_task(
         // task: waiting per commit must not re-read and hash-verify the
         // entire ledger file (O(commits squared) across a stage).
         let mut ledger_view = crate::ledger::CommittedLedger::resume(&run_root)?;
+        let mut last_visibility_lsn = applied_lsn;
         loop {
             let message = tokio::select! {
                 changed = stop_rx.changed() => {
@@ -3045,12 +3102,26 @@ async fn start_clickhouse_cdc_task(
                     }
                 }
                 ReplMsg::Keepalive {
+                    wal_end,
                     reply_requested: true,
                     ..
-                } => replication.send_standby_status(applied_lsn, false).await?,
+                } => {
+                    replication.send_standby_status(applied_lsn, false).await?;
+                    // Idle-stream visibility proof: the synchronous sink has
+                    // applied every publication change, so the keepalive end
+                    // position is a valid visible LSN even when applied_lsn
+                    // parks at the last commit.
+                    record_clickhouse_visibility(&cdc, wal_end, &mut last_visibility_lsn).await;
+                }
                 ReplMsg::Keepalive { .. } => {}
             }
         }
+        }
+        .await;
+        if let Err(error) = &outcome {
+            eprintln!("r1ctl: ClickHouse CDC task ended: {error:#}");
+        }
+        outcome
     });
     Ok(ClickHouseCdcTask { stop, join })
 }
@@ -3058,6 +3129,29 @@ async fn start_clickhouse_cdc_task(
 fn pgoutput_commit_lsn(payload: &[u8]) -> Option<u64> {
     (payload.len() >= 26 && payload.first() == Some(&b'C'))
         .then(|| u64::from_be_bytes(payload[10..18].try_into().expect("checked commit frame")))
+}
+
+/// Best-effort idle-stream visibility record.  Duplicate rows are harmless
+/// (the reader takes max(source_lsn)); failures are ignored because the next
+/// keepalive retries.
+async fn record_clickhouse_visibility(
+    cdc: &crate::clickhouse::ClickHouseCdcAdapter,
+    wal_end: u64,
+    last: &mut u64,
+) {
+    if wal_end <= *last {
+        return;
+    }
+    if cdc
+        .sink
+        .execute(&format!(
+            "INSERT INTO r1_meta.visibility VALUES ({wal_end}, now())"
+        ))
+        .await
+        .is_ok()
+    {
+        *last = wal_end;
+    }
 }
 
 async fn wait_for_ledger_hash(

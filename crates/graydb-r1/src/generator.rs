@@ -35,6 +35,26 @@ pub fn cycle_ranges(cycles: u64) -> Vec<TableRange> {
     out
 }
 
+/// The four table ranges of one 0-based seed cycle.  Equivalent to the tail
+/// of `cycle_ranges(cycle + 1)` without regenerating every prior cycle —
+/// the measured loader runs one cycle at a time, and regenerating the whole
+/// prefix per cycle is O(cycles squared).
+pub fn single_cycle_ranges(cycle: u64) -> Vec<TableRange> {
+    let base = cycle * 100;
+    [
+        (Table::Tenants, 1),
+        (Table::Customers, 5),
+        (Table::Orders, 20),
+        (Table::OrderEvents, 60),
+    ]
+    .into_iter()
+    .map(|(table, count)| TableRange {
+        table,
+        range: base + 1..base + count + 1,
+    })
+    .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Table {
     Tenants,

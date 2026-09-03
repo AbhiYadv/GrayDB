@@ -1270,16 +1270,35 @@ impl PostgresCheckpoint {
                 .first()
                 .map(|row| row.columns().iter().map(|c| c.name().to_string()).collect())
                 .unwrap_or_default();
-            let rendered: Vec<Vec<Option<String>>> = rows
-                .iter()
-                .map(|row| {
-                    row.columns()
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| postgres_cell_text(row, i))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?;
+            // Aggregate columns arrive as PostgreSQL `numeric` (sum over
+            // bigint), which tokio-postgres cannot decode.  Re-project every
+            // column through ::text inside the same REPEATABLE READ snapshot:
+            // integer numerics render exactly like the engines' canonical
+            // strings, and no query time lands in a measured window.
+            let rendered: Vec<Vec<Option<String>>> = if columns.is_empty() {
+                Vec::new()
+            } else {
+                let projection = columns
+                    .iter()
+                    .map(|name| format!("\"{name}\"::text"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let wrapped = format!(
+                    "SELECT {projection} FROM ({}) AS checkpoint_source",
+                    sql.trim_end().trim_end_matches(';')
+                );
+                let text_rows = transaction.query(&wrapped, &[]).await?;
+                text_rows
+                    .iter()
+                    .map(|row| {
+                        row.columns()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| postgres_cell_text(row, i))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
             query_digests.insert(
                 name.to_string(),
                 canonical_digest(&crate::query::QueryResult {

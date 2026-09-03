@@ -139,7 +139,7 @@ pub struct ClickHouseSink {
 /// [`StreamDecoder`], so the sink receives only a complete decoder-emitted
 /// transaction in the exact frame order in which PostgreSQL published it.
 pub struct ClickHouseCdcAdapter {
-    sink: ClickHouseSink,
+    pub(crate) sink: ClickHouseSink,
     decoder: StreamDecoder,
 }
 
@@ -669,10 +669,18 @@ impl ClickHouseAdapter {
     }
 
     async fn applied_lsn(&self) -> Result<Option<u64>> {
+        // The visibility table carries idle-stream keepalive positions: the
+        // synchronous sink has applied every publication change, so its LSN
+        // is a valid visible position even while applied transactions park
+        // at the last commit.
         let (body, _) = self
             .post(
                 &[],
-                &format!("SELECT max(source_lsn) FROM {APPLIED_TRANSACTIONS} FORMAT TabSeparated"),
+                &format!(
+                    "SELECT greatest(\
+                     (SELECT max(source_lsn) FROM {APPLIED_TRANSACTIONS}), \
+                     (SELECT max(source_lsn) FROM r1_meta.visibility)) FORMAT TabSeparated"
+                ),
             )
             .await?;
         let raw = body.trim();

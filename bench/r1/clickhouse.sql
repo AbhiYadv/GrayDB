@@ -85,3 +85,16 @@ CREATE TABLE IF NOT EXISTS r1_meta.applied_transactions
 ENGINE = MergeTree
 ORDER BY operation_sha256
 SETTINGS non_replicated_deduplication_window = 1000000;
+
+-- Idle-stream visibility proof: the CDC loop records the last keepalive end
+-- LSN when no publication changes are pending.  applied_lsn takes the
+-- greatest of this and the applied transactions, so an engine that has
+-- applied every change is visible at any later WAL position.
+CREATE TABLE IF NOT EXISTS r1_meta.visibility
+(
+    source_lsn UInt64,
+    recorded_at DateTime
+)
+ENGINE = MergeTree
+ORDER BY source_lsn
+SETTINGS non_replicated_deduplication_window = 1000000;
