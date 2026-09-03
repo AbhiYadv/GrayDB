@@ -66,7 +66,14 @@ fn compose_has_isolated_persistent_services_and_healthchecks() {
                 .split_once(':')
                 .expect("bind mount must have a source and destination")
                 .0;
-            assert!(source.starts_with("${R1_DATA_ROOT}/"), "{volume}");
+            // Persistent data must live under the external-disk data root.
+            // The only exception is repo-versioned read-only configuration
+            // (the managed pg_hba file), which is never a data path.
+            assert!(
+                source.starts_with("${R1_DATA_ROOT}/")
+                    || (source.starts_with("./") && volume.ends_with(":ro")),
+                "{volume}"
+            );
         }
     }
 }
