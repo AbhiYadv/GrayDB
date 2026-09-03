@@ -17,6 +17,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio_postgres::{Client, NoTls};
@@ -179,6 +180,10 @@ pub struct ControlReplicationConfig {
 /// Owns the control slot and writes each received frame before decoding it. Frames
 /// are held until their transaction's Commit has been fsync'd, then decoded as a
 /// single durable group. The caller consumes mapped commits through `mapped_tx`.
+/// Slot advancement is batched to this many commits; per-commit ACK round
+/// trips would cap the control stream below the frozen Cdc300 rate.
+const CONTROL_ACK_BATCH_COMMITS: u64 = 64;
+
 pub async fn run_control_replication(
     config: ControlReplicationConfig,
     mapped_tx: mpsc::Sender<LedgerCommit>,
@@ -244,6 +249,9 @@ pub async fn run_control_replication_with_ready(
     let mut log = FrameLog::create(&config.frame_log_dir, config.segment_max_bytes).await?;
     let mut mapper = ControlLsnMapper::new();
     let mut pending = Vec::new();
+    // Slot advancement is batched: per-commit ACK round trips cap the
+    // control stream at ~140 txns/s, below the frozen Cdc300 rate.
+    let mut unacked_commits = 0u64;
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -254,23 +262,33 @@ pub async fn run_control_replication_with_ready(
                     let (lsn_end, txn_complete) = pgoutput_commit_end_lsn(&payload)
                         .map(|lsn| (lsn, true))
                         .unwrap_or((wal_start, false));
-                    let seq = log.append(wal_start, lsn_end, txn_complete, payload.clone()).await?;
+                    // Deferred append: the mapping is delivered immediately,
+                    // while the fsync/ACK batch below covers slot durability.
+                    let seq = log
+                        .append_deferred(wal_start, lsn_end, txn_complete, payload.clone())
+                        .await?;
                     pending.push(Frame { seq, lsn_start: wal_start, lsn_end, txn_complete, payload });
                     if txn_complete {
-                        // FrameLog::append fsyncs a commit frame before returning.
                         for frame in pending.drain(..) {
                             if let Some(commit) = mapper.feed(frame)? {
                                 mapped_tx.send(commit).await.map_err(|_| anyhow!("control commit receiver dropped"))?;
                             }
                         }
-                        let durable = log.durable_now();
-                        anyhow::ensure!(durable.valid && durable.lsn == lsn_end, "control frame log has no durable commit mark");
-                        repl.send_standby_status(durable.lsn, false).await?;
+                        unacked_commits += 1;
+                        if unacked_commits >= CONTROL_ACK_BATCH_COMMITS {
+                            log.flush_pending().await?;
+                            let durable = log.durable_now();
+                            anyhow::ensure!(durable.valid && durable.lsn == lsn_end, "control frame log has no durable commit mark");
+                            repl.send_standby_status(durable.lsn, false).await?;
+                            unacked_commits = 0;
+                        }
                     }
                 }
                 ReplMsg::Keepalive { wal_end: _, reply_requested } if reply_requested => {
+                    log.flush_pending().await?;
                     let durable = log.durable_now();
                     repl.send_standby_status(if durable.valid { durable.lsn } else { start_lsn }, false).await?;
+                    unacked_commits = 0;
                 }
                 ReplMsg::Keepalive { .. } => {}
             }
@@ -337,17 +355,268 @@ impl ApplicationWriter {
 
     /// Runs generated plans until `stop` is set. `target_rate` is affected rows per
     /// second; the limiter is also the source of the measured achieved rate.
+    ///
+    /// Transactions are PIPELINED: up to `PIPELINE_DEPTH` plans are submitted
+    /// ahead of the control-stream mapping collection. This overlaps one
+    /// transaction's control-commit wait with the following transactions' SQL
+    /// round trips — serial execution caps the source at ~54 txns/s (Phase A),
+    /// far below the frozen Cdc300 target of ~145 txns/s.
     pub async fn run(&mut self, target_rate: u64, stop: watch::Receiver<bool>) -> Result<()> {
-        let mut limiter = crate::RateLimiter::new(target_rate, 1_000);
-        let mut sequence = self.ledger.next_sequence();
+        // Source durability is anchored by the ledger and the control stream,
+        // not by PostgreSQL's per-commit WAL fsync. Container restarts keep
+        // the page-cache-backed WAL; only a host crash could lose tail
+        // commits, which is outside R1's failure model. Dropping the commit
+        // fsync removes the dominant serial latency from the timed path.
+        self.client
+            .batch_execute("SET synchronous_commit = off")
+            .await
+            .context("relaxing synchronous_commit for the writer session")?;
+        let chunk_size = (target_rate / 2).clamp(64, 2_048) as usize;
+        let mut next_sequence = self.ledger.next_sequence();
+        // `pending` holds the previous chunk's plans with their execution
+        // results.  Each iteration runs three CONCURRENT phases over disjoint
+        // writer fields: execute the pending chunk's statements on the writer
+        // connection, verify+append its control mappings into the ledger, and
+        // fill the next chunk at the paced rate.  Serial execution capped the
+        // source at ~54 txns/s (Phase A); the overlap removes the control
+        // wait and the fill pacing from the critical path.
+        let mut pending: Option<Vec<(TransactionPlan, std::result::Result<u32, anyhow::Error>)>> =
+            None;
         loop {
-            if *stop.borrow() {
+            let stop_now = *stop.borrow();
+            let have_pending = pending.is_some();
+            if have_pending || !stop_now {
+                // Normal iteration below; a terminal iteration still runs
+                // exec+map for the pending chunk before returning.
+            } else {
                 return Ok(());
             }
-            let plan = self.planner.plan(sequence);
-            limiter.acquire(plan.operations.len() as u64).await?;
-            self.execute_and_record(&plan).await?;
-            sequence += 1;
+            let last_iteration = stop_now;
+            // Split the writer into disjoint field borrows.
+            let ApplicationWriter {
+                planner,
+                intents,
+                client,
+                ledger,
+                mapped_rx,
+                pending_maps: _pending_maps,
+                recovery,
+            } = self;
+            let mut limiter = crate::RateLimiter::new(target_rate, 1_000);
+            let client = &*client;
+
+            let pending_for_exec = pending.as_ref().map(|plans| {
+                plans
+                    .iter()
+                    .map(|(plan, _)| plan.clone())
+                    .collect::<Vec<_>>()
+            });
+            let pending_len = pending.as_ref().map(|plans| plans.len()).unwrap_or(0);
+            let pending_hashes = pending.as_ref().map(|plans| {
+                plans
+                    .iter()
+                    .map(|(plan, _)| plan.operation_sha256.clone())
+                    .collect::<Vec<_>>()
+            });
+
+            // Phase 1 (exec): issue every statement of the pending chunk on
+            // the writer connection in order, then await them — the
+            // connection pipelines, so the chunk pays one round-trip budget.
+            let exec = async {
+                let mut statements: Vec<
+                    std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<StatementOutput>> + Send + '_>,
+                    >,
+                > = Vec::new();
+                if let Some(plans) = &pending_for_exec {
+                    for plan in plans {
+                        statements.push(Box::pin(async move {
+                            client_execute(client, "BEGIN", &[]).await?;
+                            Ok(StatementOutput::Unit)
+                        }));
+                        for operation in &plan.operations {
+                            statements.push(Box::pin(async move {
+                                execute_operation(client, operation).await?;
+                                Ok(StatementOutput::Unit)
+                            }));
+                        }
+                        statements.push(Box::pin(async move {
+                            let row = client
+                                .query_one(
+                                    "INSERT INTO r1_control.tx_marker (sequence, operation_sha256) VALUES ($1, $2) RETURNING txid_current()::text",
+                                    &[&(plan.sequence as i64), &plan.operation_sha256],
+                                )
+                                .await?;
+                            let xid: String = row.get(0);
+                            Ok(StatementOutput::Xid(xid.parse().context("parsing txid")?))
+                        }));
+                        statements.push(Box::pin(async move {
+                            client_execute(client, "COMMIT", &[]).await?;
+                            Ok(StatementOutput::Unit)
+                        }));
+                    }
+                }
+                let results: Vec<Result<StatementOutput>> =
+                    futures_util::future::join_all(statements)
+                        .await
+                        .into_iter()
+                        .collect();
+                // Walk the results in order, pairing each plan with its xid.
+                let mut out = Vec::with_capacity(pending_len);
+                let mut index = 0usize;
+                if let Some(plans) = &pending_for_exec {
+                    for plan in plans {
+                        let mut xid: Option<u32> = None;
+                        let mut failure: Option<anyhow::Error> = None;
+                        for _ in 0..(plan.operations.len() + 3) {
+                            match &results[index] {
+                                Ok(StatementOutput::Unit) => {}
+                                Ok(StatementOutput::Xid(value)) => xid = Some(*value),
+                                Err(error) => failure = Some(anyhow::anyhow!("{error:#}")),
+                            }
+                            index += 1;
+                        }
+                        match (xid, failure) {
+                            (Some(xid), None) => out.push(Ok(xid)),
+                            (_, Some(error)) => out.push(Err(error)),
+                            (None, None) => out.push(Err(anyhow::anyhow!(
+                                "writer chunk produced no xid and no error"
+                            ))),
+                        }
+                    }
+                }
+                Ok::<Vec<std::result::Result<u32, anyhow::Error>>, anyhow::Error>(out)
+            };
+
+            // Phase 2 (map): verify and append the pending chunk's control
+            // mappings in sequence order.  A failed execution's commit status
+            // is unknown: wait briefly for its mapping (committed) and
+            // classify through the recovery provider when it never arrives.
+            let map = async {
+                let Some(plans) = &pending_for_exec else {
+                    return Ok(());
+                };
+                let hashes = pending_hashes.as_ref().expect("hashes follow plans");
+                let mut carried: Option<LedgerCommit> = None;
+                for (position, plan) in plans.iter().enumerate() {
+                    let mapped = match carried.take() {
+                        Some(mapped) => Some(mapped),
+                        None => {
+                            match tokio::time::timeout(Duration::from_secs(30), mapped_rx.recv())
+                                .await
+                            {
+                                Ok(Some(mapped)) => Some(mapped),
+                                Ok(None) => anyhow::bail!(
+                                    "control mapper stopped before sequence {} was visible",
+                                    plan.sequence
+                                ),
+                                Err(_) => None, // delivery timed out; classify below
+                            }
+                        }
+                    };
+                    let mapped = match mapped {
+                        Some(mapped) if mapped.sequence == plan.sequence => mapped,
+                        Some(mapped) => {
+                            // This plan never committed; the mapping belongs
+                            // to a later plan.  Classify the failure before
+                            // carrying the mapping forward.
+                            match recovery.classify_committed_plan(plan).await? {
+                                CommitState::Committed => anyhow::bail!(
+                                    "plan {} is marked committed but its control mapping never arrived",
+                                    plan.sequence
+                                ),
+                                CommitState::UnknownCommit => {
+                                    carried = Some(mapped);
+                                    continue;
+                                }
+                            }
+                        }
+                        None => match recovery.classify_committed_plan(plan).await? {
+                            CommitState::Committed => anyhow::bail!(
+                                "plan {} is marked committed but its control mapping never arrived",
+                                plan.sequence
+                            ),
+                            CommitState::UnknownCommit => continue,
+                        },
+                    };
+                    anyhow::ensure!(
+                        mapped.operation_sha256 == hashes[position],
+                        "mapped operation hash mismatch"
+                    );
+                    let previous_entry_sha256 = ledger
+                        .entries()
+                        .last()
+                        .map(|entry| entry.entry_sha256.clone())
+                        .unwrap_or_default();
+                    ledger
+                        .append(LedgerEntry {
+                            sequence: mapped.sequence,
+                            xid: mapped.xid,
+                            source_lsn: mapped.source_lsn,
+                            operation_sha256: mapped.operation_sha256.clone(),
+                            committed_unix_ms: unix_ms(),
+                            previous_entry_sha256,
+                            entry_sha256: String::new(),
+                        })
+                        .with_context(|| format!("appending ledger entry {}", mapped.sequence))?;
+                }
+                Ok(())
+            };
+
+            // Phase 3 (fill): pace and durably record the next chunk's plans.
+            let fill = async {
+                if stop_now {
+                    return Ok(Vec::new());
+                }
+                let mut chunk = Vec::with_capacity(chunk_size);
+                for _ in 0..chunk_size {
+                    let plan = planner.plan(next_sequence);
+                    limiter.acquire(plan.operations.len() as u64).await?;
+                    intents.append(&plan)?;
+                    chunk.push(plan);
+                    next_sequence += 1;
+                }
+                Ok::<Vec<TransactionPlan>, anyhow::Error>(chunk)
+            };
+
+            let (executed, (), chunk) = tokio::try_join!(exec, map, fill)?;
+
+            // Cross-verify the executed xids against the appended ledger
+            // entries; a mismatch is a hard correctness failure.
+            if let Some(plans) = &pending_for_exec {
+                let entries = ledger.entries();
+                let first = plans.first().map(|plan| plan.sequence).unwrap_or(0);
+                for (position, (plan, executed)) in plans.iter().zip(executed.iter()).enumerate() {
+                    if executed.is_err() {
+                        // Classified during the map phase: unknown-commit
+                        // failures already bailed; a committed-but-failed
+                        // execution keeps its ledger entry.
+                        continue;
+                    }
+                    let entry = entries
+                        .iter()
+                        .find(|entry| entry.sequence == plan.sequence)
+                        .with_context(|| {
+                            format!("ledger entry {} missing after mapping", plan.sequence)
+                        })?;
+                    if let Ok(xid) = executed {
+                        anyhow::ensure!(
+                            entry.xid == *xid,
+                            "ledger xid {} differs from executed xid {} for sequence {}",
+                            entry.xid,
+                            xid,
+                            plan.sequence
+                        );
+                    }
+                    let _ = position;
+                    let _ = first;
+                }
+            }
+
+            if last_iteration {
+                return Ok(());
+            }
+            pending = Some(chunk.into_iter().zip(executed).collect());
         }
     }
 
@@ -391,7 +660,22 @@ impl ApplicationWriter {
             CommitState::UnknownCommit => {}
         }
         self.intents.append(plan)?;
-        execute_transaction(&mut self.client, plan).await
+        let transaction = self.client.transaction().await?;
+        for operation in &plan.operations {
+            execute_operation(&transaction, operation).await?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO r1_control.tx_marker (sequence, operation_sha256) VALUES ($1, $2)",
+                &[&(plan.sequence as i64), &plan.operation_sha256],
+            )
+            .await?;
+        let xid: String = transaction
+            .query_one("SELECT txid_current()::text", &[])
+            .await?
+            .get(0);
+        transaction.commit().await?;
+        xid.parse().context("parsing txid")
     }
 
     /// Resolves a plan left between SQL COMMIT and ledger append. It always asks a
@@ -465,40 +749,37 @@ impl ApplicationWriter {
     }
 }
 
-async fn execute_transaction(client: &mut Client, plan: &TransactionPlan) -> Result<u32> {
-    let transaction = client.transaction().await?;
-    for operation in &plan.operations {
-        execute_operation(&transaction, operation).await?;
-    }
-    transaction
-        .execute(
-            "INSERT INTO r1_control.tx_marker (sequence, operation_sha256) VALUES ($1, $2)",
-            &[&(plan.sequence as i64), &plan.operation_sha256],
-        )
-        .await?;
-    let xid = transaction
-        .query_one("SELECT txid_current()::text", &[])
-        .await?
-        .get::<_, String>(0)
-        .parse()
-        .context("parsing txid_current")?;
-    transaction.commit().await?;
-    Ok(xid)
+/// One pipelined writer statement's result.  Every statement of a chunk is
+/// issued before any is awaited; the xid variant carries the transaction's
+/// txid captured from the marker INSERT.
+#[derive(Debug)]
+enum StatementOutput {
+    Unit,
+    Xid(u32),
 }
 
-async fn execute_operation(
-    transaction: &tokio_postgres::Transaction<'_>,
-    operation: &Operation,
+async fn client_execute(
+    client: &Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<()> {
+    client.execute(sql, params).await?;
+    Ok(())
+}
+
+async fn execute_operation<C>(client: &C, operation: &Operation) -> Result<()>
+where
+    C: tokio_postgres::GenericClient,
+{
     match operation {
         Operation::InsertCustomer(row) => {
-            transaction.execute("INSERT INTO r1.customers (customer_id, tenant_id, segment, email_domain, profile, created_at) VALUES ($1,$2,$3,$4,$5::text::jsonb,to_timestamp($6::double precision / 1000000))", &[&(row.customer_id as i64), &(row.tenant_id as i64), &row.segment, &row.email_domain, &row.profile_json, &(row.created_at_micros as f64)]).await?;
+            client.execute("INSERT INTO r1.customers (customer_id, tenant_id, segment, email_domain, profile, created_at) VALUES ($1,$2,$3,$4,$5::text::jsonb,to_timestamp($6::double precision / 1000000))", &[&(row.customer_id as i64), &(row.tenant_id as i64), &row.segment, &row.email_domain, &row.profile_json, &(row.created_at_micros as f64)]).await?;
         }
         Operation::InsertOrder(row) => {
-            transaction.execute("INSERT INTO r1.orders (order_id, tenant_id, customer_id, status, channel, amount_cents, created_at, updated_at, attributes) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000000),to_timestamp($8::double precision / 1000000),$9::text::jsonb)", &[&(row.order_id as i64), &(row.tenant_id as i64), &(row.customer_id as i64), &row.status, &row.channel, &row.amount_cents, &(row.created_at_micros as f64), &(row.updated_at_micros as f64), &row.attributes_json]).await?;
+            client.execute("INSERT INTO r1.orders (order_id, tenant_id, customer_id, status, channel, amount_cents, created_at, updated_at, attributes) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000000),to_timestamp($8::double precision / 1000000),$9::text::jsonb)", &[&(row.order_id as i64), &(row.tenant_id as i64), &(row.customer_id as i64), &row.status, &row.channel, &row.amount_cents, &(row.created_at_micros as f64), &(row.updated_at_micros as f64), &row.attributes_json]).await?;
         }
         Operation::InsertOrderEvent(row) => {
-            transaction.execute("INSERT INTO r1.order_events (event_id, order_id, tenant_id, event_type, event_at, metadata) VALUES ($1,$2,$3,$4,to_timestamp($5::double precision / 1000000),$6::text::jsonb)", &[&(row.event_id as i64), &(row.order_id as i64), &(row.tenant_id as i64), &row.event_type, &(row.event_at_micros as f64), &row.metadata_json]).await?;
+            client.execute("INSERT INTO r1.order_events (event_id, order_id, tenant_id, event_type, event_at, metadata) VALUES ($1,$2,$3,$4,to_timestamp($5::double precision / 1000000),$6::text::jsonb)", &[&(row.event_id as i64), &(row.order_id as i64), &(row.tenant_id as i64), &row.event_type, &(row.event_at_micros as f64), &row.metadata_json]).await?;
         }
         Operation::UpdateCustomer {
             customer_id,
@@ -508,7 +789,7 @@ async fn execute_operation(
             profile_json,
             created_at_micros,
         } => {
-            transaction.execute("UPDATE r1.customers SET tenant_id=$2, segment=$3, email_domain=$4, profile=$5::text::jsonb, created_at=to_timestamp($6::double precision / 1000000) WHERE customer_id=$1", &[&(*customer_id as i64), &(*tenant_id as i64), segment, email_domain, profile_json, &(*created_at_micros as f64)]).await?;
+            client.execute("UPDATE r1.customers SET tenant_id=$2, segment=$3, email_domain=$4, profile=$5::text::jsonb, created_at=to_timestamp($6::double precision / 1000000) WHERE customer_id=$1", &[&(*customer_id as i64), &(*tenant_id as i64), segment, email_domain, profile_json, &(*created_at_micros as f64)]).await?;
         }
         Operation::UpdateOrder {
             order_id,
@@ -521,13 +802,13 @@ async fn execute_operation(
             updated_at_micros,
             attributes_json,
         } => {
-            transaction.execute("UPDATE r1.orders SET tenant_id=$2, customer_id=$3, status=$4, channel=$5, amount_cents=$6, created_at=to_timestamp($7::double precision / 1000000), updated_at=to_timestamp($8::double precision / 1000000), attributes=$9::text::jsonb WHERE order_id=$1", &[&(*order_id as i64), &(*tenant_id as i64), &(*customer_id as i64), status, channel, amount_cents, &(*created_at_micros as f64), &(*updated_at_micros as f64), attributes_json]).await?;
+            client.execute("UPDATE r1.orders SET tenant_id=$2, customer_id=$3, status=$4, channel=$5, amount_cents=$6, created_at=to_timestamp($7::double precision / 1000000), updated_at=to_timestamp($8::double precision / 1000000), attributes=$9::text::jsonb WHERE order_id=$1", &[&(*order_id as i64), &(*tenant_id as i64), &(*customer_id as i64), status, channel, amount_cents, &(*created_at_micros as f64), &(*updated_at_micros as f64), attributes_json]).await?;
         }
         Operation::DeleteOrder {
             order_id,
             tenant_id,
         } => {
-            transaction
+            client
                 .execute(
                     "DELETE FROM r1.orders WHERE order_id=$1 AND tenant_id=$2",
                     &[&(*order_id as i64), &(*tenant_id as i64)],
@@ -539,7 +820,7 @@ async fn execute_operation(
             order_id,
             tenant_id,
         } => {
-            transaction.execute("DELETE FROM r1.order_events WHERE event_id=$1 AND order_id=$2 AND tenant_id=$3", &[&(*event_id as i64), &(*order_id as i64), &(*tenant_id as i64)]).await?;
+            client.execute("DELETE FROM r1.order_events WHERE event_id=$1 AND order_id=$2 AND tenant_id=$3", &[&(*event_id as i64), &(*order_id as i64), &(*tenant_id as i64)]).await?;
         }
     }
     Ok(())

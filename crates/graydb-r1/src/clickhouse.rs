@@ -12,7 +12,7 @@ use crate::query::{QueryId, QueryParameters};
 use anyhow::{anyhow, bail, Context, Result};
 use graydb_ingest::repl::ReplClient;
 use graydb_log::Frame;
-use graydb_registry::decoder::StreamDecoder;
+use graydb_registry::decoder::{DecodedBatch, StreamDecoder};
 use graydb_registry::pgoutput::TupleValue;
 use graydb_registry::{Op, TypedChange};
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,114 @@ impl SinkMetrics {
     }
 }
 
+/// One decoded, committed transaction in a CDC flush window.
+#[derive(Debug, Clone)]
+pub struct CdcCommit {
+    pub lsn: u64,
+    pub hash: String,
+    pub changes: Vec<TypedChange>,
+}
+
+impl ClickHouseSink {
+    /// Applies a WINDOW of decoded transactions with bounded HTTP: one
+    /// insert per table across the whole window, one multi-row applied-
+    /// transaction marker insert, one verification query.  The caller ACKs
+    /// PostgreSQL only through the window's last LSN after this returns.
+    pub async fn apply_window(&self, commits: &[CdcCommit]) -> Result<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        anyhow::ensure!(!commits.is_empty(), "cannot apply an empty CDC window");
+        let mut rows_by_table: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        let mut markers = String::new();
+        for commit in commits {
+            for (index, change) in commit.changes.iter().enumerate() {
+                anyhow::ensure!(
+                    change.commit_lsn == 0 || change.commit_lsn == commit.lsn,
+                    "change for {} carries commit LSN {}, window transaction LSN is {}",
+                    change.table,
+                    change.commit_lsn,
+                    commit.lsn
+                );
+                let raw = raw_table_for(&change.table)
+                    .with_context(|| format!("unsupported published table {}", change.table))?;
+                let ordinal = u32::try_from(index + 1)
+                    .context("transaction change ordinal exceeds UInt32")?;
+                let version = Version::from_lsn_ordinal(commit.lsn, ordinal);
+                rows_by_table
+                    .entry(raw.raw)
+                    .or_default()
+                    .push(render_row(raw, change, commit.lsn, ordinal, version)?.to_string());
+            }
+            let escaped = commit.hash.replace('\'', "''");
+            markers.push_str(&format!("('{}', {}, now()),", escaped, commit.lsn));
+        }
+        let last_lsn = commits.last().expect("non-empty").lsn;
+        let first_lsn = commits.first().expect("non-empty").lsn;
+        let started = std::time::Instant::now();
+        for (raw, rows) in rows_by_table {
+            let mut columns: Vec<&str> = RAW_TABLES
+                .iter()
+                .find(|t| t.raw == raw)
+                .expect("raw table comes from RAW_TABLES")
+                .columns
+                .to_vec();
+            columns.extend(["_source_lsn", "_change_ordinal", "_version", "_deleted"]);
+            let mut body = format!(
+                "INSERT INTO {raw} ({}) FORMAT JSONEachRow",
+                columns.join(", ")
+            );
+            for row in rows {
+                body.push('\n');
+                body.push_str(&row);
+            }
+            self.post(
+                &[
+                    ("date_time_input_format", "best_effort".to_string()),
+                    (
+                        "insert_deduplication_token",
+                        format!("window-{last_lsn}:{raw}"),
+                    ),
+                ],
+                &body,
+            )
+            .await?;
+        }
+        self.metrics
+            .insert_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        markers.pop();
+        self.post(
+            &[(
+                "insert_deduplication_token",
+                format!("window-{last_lsn}:markers"),
+            )],
+            &format!(
+                "INSERT INTO {APPLIED_TRANSACTIONS} (operation_sha256, source_lsn, applied_at) VALUES {markers}"
+            ),
+        )
+        .await?;
+        let started = std::time::Instant::now();
+        let (body, _) = self
+            .post(
+                &[],
+                &format!(
+                    "SELECT count() FROM {APPLIED_TRANSACTIONS} WHERE source_lsn BETWEEN {first_lsn} AND {last_lsn} FORMAT TabSeparated"
+                ),
+            )
+            .await?;
+        let verified: u64 = body.trim().parse().context("parsing window marker count")?;
+        anyhow::ensure!(
+            verified == commits.len() as u64,
+            "window marker verification failed: {} markers for {} transactions",
+            verified,
+            commits.len()
+        );
+        self.metrics
+            .verify_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        Ok(last_lsn)
+    }
+}
+
 /// Production pgoutput boundary for ClickHouse CDC. It owns the incremental
 /// [`StreamDecoder`], so the sink receives only a complete decoder-emitted
 /// transaction in the exact frame order in which PostgreSQL published it.
@@ -198,6 +306,58 @@ impl ClickHouseCdcAdapter {
     /// `operation_sha256` must be the control-stream operation hash associated
     /// with this one expected application transaction. Supplying two commits in
     /// one call is rejected so a hash can never be attached to the wrong commit.
+
+    /// Feeds frames through the incremental decoder and returns every
+    /// committed transaction batch, without applying anything.
+    pub fn feed_frames(&mut self, frames: &[Frame]) -> Result<Vec<DecodedBatch>> {
+        let mut out = Vec::new();
+        for frame in frames {
+            let batch = self.decoder.feed(std::slice::from_ref(frame))?;
+            if batch.txns > 0 {
+                anyhow::ensure!(
+                    batch.txns == 1 && batch.last_commit_lsn != 0,
+                    "expected exactly one committed pgoutput transaction per frame"
+                );
+                out.push(batch);
+            } else {
+                anyhow::ensure!(
+                    batch.changes.is_empty(),
+                    "StreamDecoder emitted changes before transaction Commit"
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Applies one flush window of decoded transactions with bounded HTTP:
+    /// one insert per table, one multi-row marker insert, one verification.
+    pub async fn apply_window(
+        &self,
+        hashes: &BTreeMap<u64, String>,
+        batches: &[DecodedBatch],
+    ) -> Result<u64> {
+        let commits: Vec<CdcCommit> = batches
+            .iter()
+            .map(|batch| {
+                let hash = hashes
+                    .get(&batch.last_commit_lsn)
+                    .with_context(|| {
+                        format!(
+                            "no ledger hash for window commit LSN {}",
+                            batch.last_commit_lsn
+                        )
+                    })?
+                    .clone();
+                Ok(CdcCommit {
+                    lsn: batch.last_commit_lsn,
+                    hash,
+                    changes: batch.changes.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.sink.apply_window(&commits).await
+    }
+
     pub async fn apply_frames<A: ReplicationAcknowledger + ?Sized>(
         &mut self,
         acknowledger: &mut A,

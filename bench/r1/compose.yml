@@ -15,6 +15,13 @@ services:
       - max_wal_senders=16
       - -c
       - hba_file=/etc/postgres/pg_hba.conf
+      # The writer runs synchronous_commit=off (durability anchored by the
+      # ledger); flush WAL eagerly so the logical streams see commits with
+      # low latency instead of the 200ms wal_writer_delay default.
+      - -c
+      - wal_writer_delay=10ms
+      - -c
+      - wal_writer_flush_after=0
     environment:
       POSTGRES_DB: r1
       POSTGRES_USER: r1

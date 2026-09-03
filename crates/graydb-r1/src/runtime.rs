@@ -178,6 +178,7 @@ pub trait RuntimeEngines: Send + Sync {
         &self,
         config: &SystemRuntimeConfig,
         run_root: &Path,
+        start_lsn: u64,
     ) -> Result<ClickHouseCdcTask>;
 }
 
@@ -920,10 +921,17 @@ where
                 .await
                 .with_context(|| format!("waiting for {engine:?} initial snapshot"))?;
         }
+        // The snapshot read LIVE data, so it already contains every change
+        // committed up to now — starting the CDC stream at the slot's
+        // creation point would re-apply that overlap and duplicate rows
+        // (the rehearsal's 11 duplicate event IDs).  Start replication from
+        // the post-snapshot WAL position instead: no gap (no writer runs
+        // during bootstrap), no overlap.
+        let cdc_start_lsn = self.current_source_lsn().await?;
         if plan.engines.contains(&EngineKind::Clickhouse) {
             self.clickhouse_cdc = Some(
                 self.engines
-                    .start_clickhouse_cdc(&self.config, run_root)
+                    .start_clickhouse_cdc(&self.config, run_root, cdc_start_lsn)
                     .await?,
             );
         }
@@ -1821,8 +1829,18 @@ impl RuntimeEngines for HttpEngines {
     }
 
     async fn bootstrap_clickhouse(&self) -> Result<()> {
-        crate::clickhouse::ClickHouseSink::new(self.clickhouse_url.clone())
-            .execute(include_str!("../../../bench/r1/clickhouse.sql"))
+        let sink = crate::clickhouse::ClickHouseSink::new(self.clickhouse_url.clone());
+        // Each run loads its own snapshot: stale rows from a previous run
+        // would double every raw table and poison the digest comparison.
+        sink.execute(
+            "DROP DATABASE IF EXISTS r1_meta; \
+             DROP TABLE IF EXISTS r1_tenants_raw; \
+             DROP TABLE IF EXISTS r1_customers_raw; \
+             DROP TABLE IF EXISTS r1_orders_raw; \
+             DROP TABLE IF EXISTS r1_order_events_raw",
+        )
+        .await?;
+        sink.execute(include_str!("../../../bench/r1/clickhouse.sql"))
             .await
     }
 
@@ -1979,8 +1997,9 @@ impl RuntimeEngines for HttpEngines {
         &self,
         config: &SystemRuntimeConfig,
         run_root: &Path,
+        start_lsn: u64,
     ) -> Result<ClickHouseCdcTask> {
-        start_clickhouse_cdc_task(config, &self.clickhouse_url, run_root).await
+        start_clickhouse_cdc_task(config, &self.clickhouse_url, run_root, start_lsn).await
     }
 }
 
@@ -2514,10 +2533,11 @@ where
                 checkpoint.replay_source_lsn,
             )
             .await?;
+        let cdc_start_lsn = services.current_source_lsn().await?;
         services.clickhouse_cdc = Some(
             services
                 .engines
-                .start_clickhouse_cdc(&services.config, run_root)
+                .start_clickhouse_cdc(&services.config, run_root, cdc_start_lsn)
                 .await?,
         );
     }
@@ -2957,6 +2977,7 @@ async fn start_clickhouse_cdc_task(
     config: &SystemRuntimeConfig,
     clickhouse_url: &str,
     run_root: &Path,
+    start_lsn: u64,
 ) -> Result<ClickHouseCdcTask> {
     use graydb_ingest::repl::ReplClient;
     let admin = TokioPostgresConnector.connect(&config.postgres_url).await?;
@@ -2975,13 +2996,19 @@ async fn start_clickhouse_cdc_task(
         &config.postgres_database,
     )
     .await?;
-    let snapshot = replication
+    // The slot anchors WAL retention; replication STARTS at the caller's
+    // post-snapshot LSN (see bootstrap) so the stream never re-applies
+    // changes already contained in the loaded snapshot.
+    if let Err(error) = replication
         .create_slot_with_snapshot(CLICKHOUSE_CDC_SLOT)
-        .await?;
-    let initial_lsn = graydb_ingest::repl::parse_lsn(&snapshot.consistent_point)?;
+        .await
+    {
+        tracing::debug!(%error, "ClickHouse CDC slot already present; reusing");
+    }
     replication
-        .start_replication(CLICKHOUSE_CDC_SLOT, "graydb_r1_pub", initial_lsn)
+        .start_replication(CLICKHOUSE_CDC_SLOT, "graydb_r1_pub", start_lsn)
         .await?;
+    let initial_lsn = start_lsn;
     let config = config.clone();
     let clickhouse_url = clickhouse_url.to_owned();
     let run_root = run_root.to_path_buf();
@@ -3000,6 +3027,14 @@ async fn start_clickhouse_cdc_task(
         // entire ledger file (O(commits squared) across a stage).
         let mut ledger_view = crate::ledger::CommittedLedger::resume(&run_root)?;
         let mut last_visibility_lsn = applied_lsn;
+        // CDC flush window: transactions are buffered and applied as one
+        // bounded batch per table, amortizing the per-commit HTTP cost.
+        // Recovery is boundary-safe: on reconnect the stream re-delivers
+        // from the last acknowledged LSN and the per-window deduplication
+        // tokens drop already-inserted blocks.
+        let mut window: Vec<Frame> = Vec::new();
+        let mut window_commits = 0u64;
+        let mut window_started = Instant::now();
         loop {
             let message = tokio::select! {
                 changed = stop_rx.changed() => {
@@ -3063,42 +3098,35 @@ async fn start_clickhouse_cdc_task(
                     let sequence = frame_log
                         .append(wal_start, lsn_end, commit_lsn.is_some(), payload.clone())
                         .await?;
-                    let hash = match commit_lsn {
-                        Some(lsn) => wait_for_ledger_hash(&mut ledger_view, lsn).await?,
-                        None => String::new(),
-                    };
-                    let frame = Frame {
+                    window.push(Frame {
                         seq: sequence,
                         lsn_start: wal_start,
                         lsn_end,
                         txn_complete: commit_lsn.is_some(),
                         payload,
-                    };
-                    match cdc.apply_frames(&mut replication, &hash, &[frame]).await {
-                        Ok(Some(_)) => applied_lsn = lsn_end,
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "ClickHouse CDC apply interrupted; reconnecting from last applied LSN");
-                            cdc = crate::clickhouse::ClickHouseCdcAdapter::new(
-                                clickhouse_url.clone(),
-                            );
-                            replication.close().await.ok();
-                            replication = ReplClient::connect(
-                                &config.postgres_host,
-                                config.postgres_port,
-                                &config.postgres_user,
-                                &config.postgres_password,
-                                &config.postgres_database,
-                            )
-                            .await?;
-                            replication
-                                .start_replication(
-                                    CLICKHOUSE_CDC_SLOT,
-                                    "graydb_r1_pub",
-                                    applied_lsn,
-                                )
-                                .await?;
-                        }
+                    });
+                    if commit_lsn.is_some() {
+                        window_commits += 1;
+                    }
+                    let flush = window_commits >= WINDOW_COMMITS
+                        || (window_commits > 0
+                            && window_started.elapsed() >= WINDOW_FLUSH_INTERVAL);
+                    if flush {
+                        let commit_lsns: Vec<u64> = window
+                            .iter()
+                            .filter(|frame| frame.txn_complete)
+                            .map(|frame| frame.lsn_end)
+                            .collect();
+                        let hashes =
+                            resolve_window_hashes(&mut ledger_view, &commit_lsns).await?;
+                        let batches = cdc.feed_frames(&window)?;
+                        let last = cdc.apply_window(&hashes, &batches).await?;
+                        frame_log.flush_pending().await?;
+                        replication.send_standby_status(last, false).await?;
+                        applied_lsn = last;
+                        window.clear();
+                        window_commits = 0;
+                        window_started = Instant::now();
                     }
                 }
                 ReplMsg::Keepalive {
@@ -3126,6 +3154,41 @@ async fn start_clickhouse_cdc_task(
     Ok(ClickHouseCdcTask { stop, join })
 }
 
+/// CDC flush window: commits buffered before one bounded batched apply.
+const WINDOW_COMMITS: u64 = 256;
+/// Maximum time a partial window waits before flushing (freshness bound).
+const WINDOW_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Resolves the ledger operation hash for every buffered commit LSN,
+/// polling until the writer's ledger catches up with the stream.
+async fn resolve_window_hashes(
+    ledger_view: &mut crate::ledger::CommittedLedger,
+    commit_lsns: &[u64],
+) -> Result<BTreeMap<u64, String>> {
+    loop {
+        ledger_view.refresh()?;
+        let entries = ledger_view.entries();
+        let mut out = BTreeMap::new();
+        let mut missing = false;
+        for &lsn in commit_lsns {
+            let index = entries.partition_point(|entry| entry.source_lsn < lsn);
+            match entries.get(index).filter(|entry| entry.source_lsn == lsn) {
+                Some(entry) => {
+                    out.insert(lsn, entry.operation_sha256.clone());
+                }
+                None => {
+                    missing = true;
+                    break;
+                }
+            }
+        }
+        if !missing {
+            return Ok(out);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn pgoutput_commit_lsn(payload: &[u8]) -> Option<u64> {
     (payload.len() >= 26 && payload.first() == Some(&b'C'))
         .then(|| u64::from_be_bytes(payload[10..18].try_into().expect("checked commit frame")))
@@ -3151,31 +3214,6 @@ async fn record_clickhouse_visibility(
         .is_ok()
     {
         *last = wal_end;
-    }
-}
-
-async fn wait_for_ledger_hash(
-    ledger: &mut crate::ledger::CommittedLedger,
-    source_lsn: u64,
-) -> Result<String> {
-    let started = Instant::now();
-    loop {
-        ledger.refresh()?;
-        // Ledger source LSNs are monotonic, so the commit-end position is a
-        // binary search, not a linear scan.
-        let entries = ledger.entries();
-        let index = entries.partition_point(|entry| entry.source_lsn < source_lsn);
-        if let Some(entry) = entries
-            .get(index)
-            .filter(|entry| entry.source_lsn == source_lsn)
-        {
-            return Ok(entry.operation_sha256.clone());
-        }
-        anyhow::ensure!(
-            started.elapsed() < Duration::from_secs(30),
-            "ClickHouse CDC commit LSN {source_lsn} had no committed ledger hash after 30 seconds"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
