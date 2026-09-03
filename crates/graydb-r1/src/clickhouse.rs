@@ -133,6 +133,41 @@ impl ReplicationAcknowledger for ReplClient {
 pub struct ClickHouseSink {
     client: reqwest::Client,
     base_url: String,
+    metrics: SinkMetrics,
+}
+
+/// Phase A diagnostic counters: where the CDC apply budget goes.  All values
+/// are cumulative for this sink instance.
+#[derive(Debug, Default)]
+pub struct SinkMetrics {
+    pub requests: std::sync::atomic::AtomicU64,
+    pub request_ns: std::sync::atomic::AtomicU64,
+    pub insert_ns: std::sync::atomic::AtomicU64,
+    pub marker_ns: std::sync::atomic::AtomicU64,
+    pub verify_ns: std::sync::atomic::AtomicU64,
+}
+
+/// Immutable copy of [`SinkMetrics`] for reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SinkMetricsSnapshot {
+    pub requests: u64,
+    pub request_ns: u64,
+    pub insert_ns: u64,
+    pub marker_ns: u64,
+    pub verify_ns: u64,
+}
+
+impl SinkMetrics {
+    fn snapshot(&self) -> SinkMetricsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        SinkMetricsSnapshot {
+            requests: self.requests.load(Relaxed),
+            request_ns: self.request_ns.load(Relaxed),
+            insert_ns: self.insert_ns.load(Relaxed),
+            marker_ns: self.marker_ns.load(Relaxed),
+            verify_ns: self.verify_ns.load(Relaxed),
+        }
+    }
 }
 
 /// Production pgoutput boundary for ClickHouse CDC. It owns the incremental
@@ -211,7 +246,13 @@ impl ClickHouseSink {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
+            metrics: SinkMetrics::default(),
         }
+    }
+
+    /// Cumulative Phase A diagnostic counters for this sink instance.
+    pub fn metrics(&self) -> SinkMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Runs DDL or other statement batches (bootstrap uses `bench/r1/clickhouse.sql`).
@@ -248,21 +289,60 @@ impl ClickHouseSink {
         operation_sha256: &str,
         changes: &[TypedChange],
     ) -> Result<ApplyOutcome> {
+        use std::sync::atomic::Ordering::Relaxed;
         if self
             .transaction_is_applied(commit_lsn, operation_sha256)
             .await?
         {
             return Ok(ApplyOutcome::SkippedIdempotent);
         }
+        let started = std::time::Instant::now();
         self.insert_version_rows(commit_lsn, operation_sha256, changes, false)
             .await?;
+        self.metrics
+            .insert_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        let started = std::time::Instant::now();
+        self.record_marker(commit_lsn, operation_sha256).await?;
+        self.metrics
+            .marker_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        let started = std::time::Instant::now();
+        anyhow::ensure!(
+            self.transaction_is_applied(commit_lsn, operation_sha256)
+                .await?,
+            "transaction marker was not visible after insertion at source LSN {commit_lsn}"
+        );
+        self.metrics
+            .verify_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        Ok(ApplyOutcome::Applied)
+    }
+
+    /// Phase A partial-failure seam: inserts the version rows exactly like
+    /// [`Self::apply_transaction`] does — same table-grouped blocks, same
+    /// deterministic deduplication tokens — but stops before the marker.  A
+    /// retry of the full transaction must then prove that the deterministic
+    /// tokens deduplicate the already-inserted rows.
+    pub async fn apply_rows_without_marker(
+        &self,
+        commit_lsn: u64,
+        operation_sha256: &str,
+        changes: &[TypedChange],
+    ) -> Result<()> {
+        self.insert_version_rows(commit_lsn, operation_sha256, changes, false)
+            .await
+    }
+
+    /// Phase A seam: writes and verifies only the applied-transaction marker.
+    pub async fn write_marker(&self, commit_lsn: u64, operation_sha256: &str) -> Result<()> {
         self.record_marker(commit_lsn, operation_sha256).await?;
         anyhow::ensure!(
             self.transaction_is_applied(commit_lsn, operation_sha256)
                 .await?,
             "transaction marker was not visible after insertion at source LSN {commit_lsn}"
         );
-        Ok(ApplyOutcome::Applied)
+        Ok(())
     }
 
     /// Applies the initial snapshot: every row is the first version of its key
@@ -397,12 +477,21 @@ impl ClickHouseSink {
         Ok(())
     }
 
-    async fn post(
+    /// Raw HTTP POST with query parameters; exposed for the Phase A
+    /// diagnostics that count and time requests outside the sink phases.
+    pub async fn post(
         &self,
         params: &[(&str, String)],
         body: &str,
     ) -> Result<(String, reqwest::header::HeaderMap)> {
-        clickhouse_request(&self.client, &self.base_url, params, body).await
+        use std::sync::atomic::Ordering::Relaxed;
+        let started = std::time::Instant::now();
+        let result = clickhouse_request(&self.client, &self.base_url, params, body).await;
+        self.metrics.requests.fetch_add(1, Relaxed);
+        self.metrics
+            .request_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        result
     }
 }
 

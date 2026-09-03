@@ -22,7 +22,7 @@ pub use adapter::{EngineAdapter, EngineStatus, QueryInvocation, QueryResult};
 pub use artifacts::{sha256_tree, Event, EventLevel, EventRender, EventSink, RunDirectory};
 pub use clickhouse::{
     ApplyOutcome, ClickHouseAdapter, ClickHouseCdcAdapter, ClickHouseSink, ClickHouseStatus,
-    ReplicationAcknowledger, Version,
+    ReplicationAcknowledger, SinkMetricsSnapshot, Version,
 };
 pub use contracts::{
     EngineKind, LogicalCheckpoint, ProfileCatalog, ProfileSpec, RunConfig, RunMode, ScaleProfile,
