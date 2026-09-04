@@ -17,6 +17,7 @@ use graydb_registry::pgoutput::TupleValue;
 use graydb_registry::{Op, TypedChange};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -229,12 +230,14 @@ impl ClickHouseSink {
                 body.push('\n');
                 body.push_str(&row);
             }
+            let deduplication_token =
+                window_deduplication_token(raw, &format!("window-{last_lsn}"), &body);
             self.post(
                 &[
                     ("date_time_input_format", "best_effort".to_string()),
                     (
                         "insert_deduplication_token",
-                        format!("window-{last_lsn}:{raw}"),
+                        deduplication_token,
                     ),
                 ],
                 &body,
@@ -245,10 +248,15 @@ impl ClickHouseSink {
             .insert_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
         markers.pop();
+        let marker_token = window_deduplication_token(
+            APPLIED_TRANSACTIONS,
+            &format!("window-{last_lsn}"),
+            &markers,
+        );
         self.post(
             &[(
                 "insert_deduplication_token",
-                format!("window-{last_lsn}:markers"),
+                marker_token,
             )],
             &format!(
                 "INSERT INTO {APPLIED_TRANSACTIONS} (operation_sha256, source_lsn, applied_at) VALUES {markers}"
@@ -276,6 +284,18 @@ impl ClickHouseSink {
             .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
         Ok(last_lsn)
     }
+}
+
+/// Derives a stable ClickHouse insert-deduplication token from the complete
+/// immutable request body. A boundary-only token would collide when a replay
+/// retries the same final LSN with a different window start or contents.
+fn window_deduplication_token(table: &str, boundary: &str, body: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [table, boundary, body] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("graydb-r1-window-v2-{:x}", hasher.finalize())
 }
 
 /// Production pgoutput boundary for ClickHouse CDC. It owns the incremental
@@ -1284,6 +1304,18 @@ mod tests {
         assert!(a < b);
         assert!(b < c);
         assert_eq!(c.as_u128(), 101u128 << 32);
+    }
+
+    #[test]
+    fn window_retry_token_changes_when_window_contents_change() {
+        let first = window_deduplication_token("r1_orders_raw", "window-200", "row-a");
+        let changed = window_deduplication_token("r1_orders_raw", "window-200", "row-b");
+
+        assert_ne!(first, changed);
+        assert_eq!(
+            first,
+            window_deduplication_token("r1_orders_raw", "window-200", "row-a")
+        );
     }
 
     #[test]
