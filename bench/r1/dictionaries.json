@@ -1,0 +1,15 @@
+{
+  "version": 3,
+  "weighted_dictionaries": {
+    "regions": [["us-east", 46], ["us-west", 27], ["eu-west", 18], ["ap-south", 9]],
+    "plans": [["free", 70], ["pro", 23], ["enterprise", 7]],
+    "segments": [["consumer", 55], ["smb", 29], ["mid-market", 12], ["enterprise", 4]],
+    "email_domains": [["example.com", 58], ["mail.test", 25], ["corp.test", 12], ["acme.test", 5]],
+    "statuses": [["paid", 46], ["shipped", 27], ["pending", 15], ["cancelled", 8], ["refunded", 4]],
+    "channels": [["web", 61], ["mobile", 31], ["partner", 8]],
+    "event_types": [["created", 42], ["paid", 30], ["fulfilled", 17], ["cancelled", 7], ["returned", 4]]
+  },
+  "tenant_activity": {"distribution": "bounded_zipf", "max_rank": 64, "weight_formula": "floor(10000 / rank)", "assignment": "customers select among the loaded tenant prefix; orders and events inherit ownership through references"},
+  "amount_cents": {"distribution": "long_tailed", "buckets": [[100, 2499, 55], [2500, 9999, 27], [10000, 49999, 12], [50000, 249999, 5], [250000, 2000000, 1]]},
+  "json_metadata": {"key_order": "BTreeMap lexicographic", "max_bytes": 256, "label_length_histogram": [[3, 55], [16, 27], [64, 12], [128, 6]]}
+}

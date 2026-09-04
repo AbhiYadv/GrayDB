@@ -21,6 +21,7 @@ use datafusion::scalar::ScalarValue;
 // (columnar reads now flow through provider.rs streaming scans)
 use graydb_ingest::repl::format_lsn;
 use graydb_search::SearchReader;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub struct TableShape {
     pub dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsnProof {
     pub target_lsn: Option<u64>,
     /// Last source WAL position received on the replication stream
@@ -129,6 +130,11 @@ pub async fn run_query(
         .map_err(anyhow_df)?;
     catalog
         .register_schema("graydb", Arc::new(MemorySchemaProvider::new()))
+        .map_err(anyhow_df)?;
+    // Columnar table names carry their PostgreSQL schema ("r1.orders"); the
+    // schema must exist for the dotted registrations below to resolve.
+    catalog
+        .register_schema("r1", Arc::new(MemorySchemaProvider::new()))
         .map_err(anyhow_df)?;
 
     let mut shapes: Vec<(String, u64)> = Vec::new();

@@ -1,0 +1,95 @@
+name: graydb-r1
+
+services:
+  postgres:
+    # The tag is resolved and recorded by scripts/r1-colima.sh before dataset creation.
+    image: postgres:17
+    mem_limit: 3g
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+      - -c
+      - hba_file=/etc/postgres/pg_hba.conf
+      # The writer runs synchronous_commit=off (durability anchored by the
+      # ledger); flush WAL eagerly so the logical streams see commits with
+      # low latency instead of the 200ms wal_writer_delay default.
+      - -c
+      - wal_writer_delay=10ms
+      - -c
+      - wal_writer_flush_after=0
+    environment:
+      POSTGRES_DB: r1
+      POSTGRES_USER: r1
+      POSTGRES_PASSWORD: graydb_r1
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - "${R1_DATA_ROOT}/postgres:/var/lib/postgresql/data"
+      - "./postgres/pg_hba.conf:/etc/postgres/pg_hba.conf:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U r1 -d r1 -tAc 'SELECT 1' | grep -qx 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  graydb:
+    build:
+      context: ../..
+      dockerfile: bench/r1/Dockerfile
+      args:
+        GIT_SHA: ${R1_GIT_SHA:-unrecorded}
+    image: graydb-r1:${R1_GIT_SHA:-unrecorded}
+    mem_limit: 4g
+    init: true
+    environment:
+      GRAYDB_CONFIG: /etc/graydb/graydb-r1.toml
+      GRAYDB_STUDIO_BIND: 0.0.0.0
+      GRAYDB_STUDIO_PORT: 7432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:57432:7432"
+    volumes:
+      - "${R1_DATA_ROOT}/graydb:/var/lib/graydb"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:7432/ >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  clickhouse:
+    # The tag is resolved and recorded by scripts/r1-colima.sh before dataset creation.
+    image: clickhouse/clickhouse-server:25.8
+    mem_limit: 4g
+    environment:
+      CLICKHOUSE_DB: r1
+    ports:
+      - "127.0.0.1:58123:8123"
+    volumes:
+      - "${R1_DATA_ROOT}/clickhouse:/var/lib/clickhouse"
+      - "${R1_DATA_ROOT}/clickhouse-logs:/var/log/clickhouse-server"
+    configs:
+      - source: r1-clickhouse-config
+        target: /etc/clickhouse-server/config.d/r1.xml
+      - source: r1-clickhouse-users
+        target: /etc/clickhouse-server/users.d/r1.xml
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+configs:
+  r1-clickhouse-config:
+    file: ./clickhouse/config.xml
+  r1-clickhouse-users:
+    file: ./clickhouse/users.xml

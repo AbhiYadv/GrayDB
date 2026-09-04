@@ -143,21 +143,31 @@ mod tail_tests {
         let mut log = FrameLog::create(&dir, 1 << 20).await.unwrap();
         let mut tail = LogTail::new(&dir);
 
-        log.append(1, 2, false, Bytes::from_static(b"B1")).await.unwrap();
-        log.append(2, 3, true, Bytes::from_static(b"C1")).await.unwrap();
+        log.append(1, 2, false, Bytes::from_static(b"B1"))
+            .await
+            .unwrap();
+        log.append(2, 3, true, Bytes::from_static(b"C1"))
+            .await
+            .unwrap();
         let b = tail.read_new().unwrap();
         assert_eq!(b.frames.len(), 2);
         assert!(!b.rewound);
 
         // Uncommitted tail, then crash + resume (truncates it away).
-        log.append(4, 5, false, Bytes::from_static(b"B2")).await.unwrap();
+        log.append(4, 5, false, Bytes::from_static(b"B2"))
+            .await
+            .unwrap();
         let b = tail.read_new().unwrap();
         assert_eq!(b.frames.len(), 1, "tail sees the uncommitted frame");
         drop(log);
         let mut log = FrameLog::resume(&dir, 1 << 20).await.unwrap();
         // Fresh session re-delivers the transaction, then commits it.
-        log.append(4, 5, false, Bytes::from_static(b"B2")).await.unwrap();
-        log.append(5, 6, true, Bytes::from_static(b"C2")).await.unwrap();
+        log.append(4, 5, false, Bytes::from_static(b"B2"))
+            .await
+            .unwrap();
+        log.append(5, 6, true, Bytes::from_static(b"C2"))
+            .await
+            .unwrap();
 
         let b = tail.read_new().unwrap();
         assert!(b.rewound, "truncation must be reported");

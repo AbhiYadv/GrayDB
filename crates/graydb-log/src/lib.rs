@@ -80,7 +80,10 @@ pub fn decode_frame(data: &mut &[u8]) -> Result<Option<Frame>> {
     let payload_len = hdr.get_u32() as usize;
     let total = HEADER_LEN + payload_len + 4;
     if full.len() < total {
-        bail!("truncated frame payload (seq {seq}: need {total}, have {})", full.len());
+        bail!(
+            "truncated frame payload (seq {seq}: need {total}, have {})",
+            full.len()
+        );
     }
     let crc_stored = (&full[HEADER_LEN + payload_len..]).get_u32();
     let crc_actual = crc32c::crc32c(&full[..HEADER_LEN + payload_len]);
@@ -190,7 +193,9 @@ impl FrameLog {
         // Truncate past the boundary; drop later segments entirely.
         let (next_seq, mark) = match boundary {
             Some((seg_idx, end_offset, seq, lsn)) => {
-                let f = std::fs::OpenOptions::new().write(true).open(&segs[seg_idx])?;
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&segs[seg_idx])?;
                 f.set_len(end_offset)?;
                 f.sync_all()?;
                 for seg in &segs[seg_idx + 1..] {
@@ -283,8 +288,7 @@ impl FrameLog {
         if self.stalled {
             // Rung 3: write path degraded — divert to staging (unsynced, unacked).
             if self.spill_file.is_none() {
-                self.spill_file =
-                    Some(tokio::fs::File::create(&self.staging_path).await?);
+                self.spill_file = Some(tokio::fs::File::create(&self.staging_path).await?);
             }
             self.spill_file
                 .as_mut()
@@ -296,8 +300,75 @@ impl FrameLog {
             return Ok(seq);
         }
 
-        self.write_durable(seq, lsn_end, txn_complete, &encoded).await?;
+        self.write_durable(seq, lsn_end, txn_complete, &encoded)
+            .await?;
         Ok(seq)
+    }
+
+    /// Appends a frame WITHOUT publishing durability: the caller batches
+    /// `flush_pending()` before the slot ACK.  Same spill/staging behavior as
+    /// `append`; the pending commit mark is published only by
+    /// `flush_pending()`, so an unflushed commit is never acked.
+    pub async fn append_deferred(
+        &mut self,
+        lsn_start: u64,
+        lsn_end: u64,
+        txn_complete: bool,
+        payload: Bytes,
+    ) -> Result<u64> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.total_frames += 1;
+        if txn_complete {
+            self.total_commits += 1;
+        }
+        let encoded = encode_frame(&Frame {
+            seq,
+            lsn_start,
+            lsn_end,
+            txn_complete,
+            payload,
+        });
+
+        if self.stalled {
+            if self.spill_file.is_none() {
+                self.spill_file = Some(tokio::fs::File::create(&self.staging_path).await?);
+            }
+            self.spill_file
+                .as_mut()
+                .expect("spill file just ensured")
+                .write_all(&encoded)
+                .await?;
+            self.spill.push(encoded);
+            self.spilled_frames += 1;
+            return Ok(seq);
+        }
+
+        self.file.write_all(&encoded).await?;
+        self.segment_len += encoded.len() as u64;
+        if txn_complete {
+            self.pending_commit = Some((seq, lsn_end));
+            if self.segment_len >= self.segment_max_bytes {
+                self.flush_pending().await?;
+                self.roll_segment().await?;
+            }
+        }
+        Ok(seq)
+    }
+
+    /// Publishes the last deferred commit mark: fsyncs the segment, then
+    /// makes the durable mark visible to `durable_now()`.  No-op when nothing
+    /// is pending.
+    pub async fn flush_pending(&mut self) -> Result<()> {
+        if let Some((dseq, dlsn)) = self.pending_commit.take() {
+            self.file.sync_all().await.context("fsync frame segment")?;
+            self.durable_tx.send_replace(DurableMark {
+                seq: dseq,
+                lsn: dlsn,
+                valid: true,
+            });
+        }
+        Ok(())
     }
 
     async fn write_durable(
@@ -363,7 +434,10 @@ impl FrameLog {
                 last_commit = Some((seq, lsn_end));
             }
         }
-        self.file.sync_all().await.context("fsync drained staging")?;
+        self.file
+            .sync_all()
+            .await
+            .context("fsync drained staging")?;
         if let Some((seq, lsn)) = last_commit {
             self.durable_tx.send_replace(DurableMark {
                 seq,
@@ -532,10 +606,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gdb-log-test-{}", std::process::id()));
         let mut log = FrameLog::create(&dir, 1 << 20).await.unwrap();
         assert!(!log.durable_now().valid);
-        log.append(10, 20, false, Bytes::from_static(b"B")).await.unwrap();
-        log.append(20, 30, false, Bytes::from_static(b"I")).await.unwrap();
+        log.append(10, 20, false, Bytes::from_static(b"B"))
+            .await
+            .unwrap();
+        log.append(20, 30, false, Bytes::from_static(b"I"))
+            .await
+            .unwrap();
         assert!(!log.durable_now().valid, "no commit yet => no durable mark");
-        log.append(30, 40, true, Bytes::from_static(b"C")).await.unwrap();
+        log.append(30, 40, true, Bytes::from_static(b"C"))
+            .await
+            .unwrap();
         let m = log.durable_now();
         assert!(m.valid);
         assert_eq!(m.lsn, 40);
@@ -548,10 +628,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gdb-log-resume-{}", std::process::id()));
         {
             let mut log = FrameLog::create(&dir, 1 << 20).await.unwrap();
-            log.append(1, 2, false, Bytes::from_static(b"B1")).await.unwrap();
-            log.append(2, 3, true, Bytes::from_static(b"C1")).await.unwrap(); // durable
-            log.append(4, 5, false, Bytes::from_static(b"B2")).await.unwrap(); // unsynced tail
-            // crash: drop without commit of txn 2
+            log.append(1, 2, false, Bytes::from_static(b"B1"))
+                .await
+                .unwrap();
+            log.append(2, 3, true, Bytes::from_static(b"C1"))
+                .await
+                .unwrap(); // durable
+            log.append(4, 5, false, Bytes::from_static(b"B2"))
+                .await
+                .unwrap(); // unsynced tail
+                           // crash: drop without commit of txn 2
         }
         // Simulate a torn write at the very end.
         let seg = std::fs::read_dir(&dir)
@@ -566,9 +652,15 @@ mod tests {
         let mut log = FrameLog::resume(&dir, 1 << 20).await.unwrap();
         let m = log.durable_now();
         assert!(m.valid);
-        assert_eq!((m.seq, m.lsn), (1, 3), "durable boundary = last commit frame");
+        assert_eq!(
+            (m.seq, m.lsn),
+            (1, 3),
+            "durable boundary = last commit frame"
+        );
         // Continue appending: seq must be contiguous after the boundary.
-        log.append(6, 7, true, Bytes::from_static(b"C2")).await.unwrap();
+        log.append(6, 7, true, Bytes::from_static(b"C2"))
+            .await
+            .unwrap();
         let v = verify_log(&dir, false, |_| {}).unwrap();
         assert_eq!(v.frames, 3, "torn tail gone, new frame appended");
         assert!(v.seq_contiguous);
@@ -581,11 +673,17 @@ mod tests {
     async fn stall_diverts_and_resume_drains_in_order() {
         let dir = std::env::temp_dir().join(format!("gdb-log-stall-{}", std::process::id()));
         let mut log = FrameLog::create(&dir, 1 << 20).await.unwrap();
-        log.append(1, 2, true, Bytes::from_static(b"C1")).await.unwrap();
+        log.append(1, 2, true, Bytes::from_static(b"C1"))
+            .await
+            .unwrap();
         let before = log.durable_now();
         log.set_stalled(true).await.unwrap();
-        log.append(3, 4, false, Bytes::from_static(b"I2")).await.unwrap();
-        log.append(4, 5, true, Bytes::from_static(b"C2")).await.unwrap();
+        log.append(3, 4, false, Bytes::from_static(b"I2"))
+            .await
+            .unwrap();
+        log.append(4, 5, true, Bytes::from_static(b"C2"))
+            .await
+            .unwrap();
         assert_eq!(log.durable_now(), before, "stalled: mark must NOT advance");
         assert_eq!(log.spilled_frames, 2);
         log.set_stalled(false).await.unwrap();

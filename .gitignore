@@ -1,6 +1,7 @@
 # Build output (23 GB — never commit)
 target/
 dist/
+.worktrees/
 
 # Derived data: every byte is rebuildable from snapshot + log replay (invariant I3)
 data/
@@ -19,3 +20,6 @@ err*.txt
 sp7-run*.log
 studio-run.log
 package-run.log
+.r1/
+.env.r1
+bench-results/r1-p1-v1-*/

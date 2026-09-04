@@ -1,0 +1,32 @@
+[package]
+name = "graydb-r1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+fs2 = { workspace = true }
+futures-util = { workspace = true }
+graydb-columnar = { path = "../graydb-columnar" }
+graydb-ingest = { path = "../graydb-ingest" }
+graydb-log = { path = "../graydb-log" }
+graydb-registry = { path = "../graydb-registry" }
+graydb-studio = { path = "../graydb-studio" }
+hdrhistogram = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

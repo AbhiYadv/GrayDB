@@ -1,0 +1,9 @@
+.git
+.r1
+.superpowers
+.worktrees
+target
+dist
+data
+bench-results
+*.log
