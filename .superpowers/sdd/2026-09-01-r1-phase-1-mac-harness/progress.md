@@ -72,6 +72,11 @@
 - Ruling: keep service-dependent integration tests ignored until Task 11 creates the Compose environment — this preserves task independence without weakening the tests; cost if wrong: integration failures surface later than unit failures.
 - Ruling: run the controller on the host while databases run in Compose — the user asked to see terminal logs, and this keeps the data-plane services independently killable; cost if wrong: host controller resource usage must be captured for fairness.
 - Ruling: treat the Task 3 distribution and JSON ordering gaps as load-bearing — Task 4 manifests and later correctness reports depend on the frozen generator shape matching spec section 4.2; cost if wrong: extra generator rework if the final re-review had already accepted the current implementation.
+- Ruling: repair the interrupted uncommitted Task 9 syntax without committing it before resuming Task 6 verification — the shared worktree cannot compile Task 6 while `oracle.rs` has an unmatched delimiter; cost if wrong: temporary Task 9 code is exercised before its own formal task review, but it remains uncommitted and will still enter the full Task 9 loop.
+- Ruling: replace the plan's primary-key-only `ReplacingMergeTree(_version)` layout with a version-preserving `MergeTree ORDER BY (primary_key, _version)` design — spec section 8 permits an equivalent version-preserving MergeTree and exact historical LSN reads cannot survive replacement merges otherwise; cost if wrong: ClickHouse storage amplification and comparison characteristics differ from the plan's literal DDL choice.
+- Ruling: move `invalid_result(reason)` to Task 10's `report` test module when the real `RunResult` exists and remove Task 9's reduced production surrogate — the plan itself assigns `RunResult` to Task 10, so Task 9 cannot honestly construct the complete zero-metric result yet; cost if wrong: Task 9 loses a local fixture until Task 10 lands.
+- Ruling: keep the Compose contract target at repository-relative `bench/r1/compose.yml`, not the pre-existing product `docker-compose.yml` — Task 11 explicitly creates the isolated R1 Compose environment there and must not validate or mutate the unrelated product stack; cost if wrong: Compose parsing remains intentionally unexecutable until Task 11 creates the file.
+- Ruling: make Task 11 expose a safe host `r1ctl` build hook that defers until Task 12 creates the binary, rather than adding a duplicate placeholder CLI — Task 12 owns `src/bin/r1ctl.rs` and a fake binary would create an invalid integration seam; cost if wrong: the first Task 11-only environment run cannot build the host CLI until Task 12 is complete.
 
 ## Dispatch
 
@@ -99,6 +104,26 @@
 - Task 5 reviewer: `/root/r1_task5_review` (`gpt-5.4`, medium), package `review-5b3d0ee..8f91358.diff`, initial FAIL recorded locally because the review artifact did not materialize.
 - Task 5 fix round 1: local root fix from `8f91358` to current HEAD corrected frozen transaction sizes, schema-ready operation payloads, per-table routing, and minute-bucket rate accounting.
 - Task 5 scoped re-review: PASS after fix round 1; workload and ledger suites are green, and only the pre-existing `graydb-registry` clippy warning remains outside scope.
+- Task 5 process correction: reviewer candidate `417d8d0` was independently reimplemented/hardened by original worker in `225e32b`; cumulative scoped re-review `/root/r1_task5_rereview` (`gpt-5.4-mini`, low), package `review-8f91358..225e32b.diff`, PASS; no new in-scope gaps.
+- Task 6 implementer: `/root/r1_task6_replication` (`gpt-5.6-terra`, high), brief `task-6-brief.md`, report `task-6-report.md`, BASE `225e32b`.
+- Task 6 reviewer: `/root/r1_task6_review` (`gpt-5.5`, medium), package `review-225e32b..863e3ac.diff`, pending.
+- Task 6 first reviewer errored on usage limit; retry `/root/r1_task6_review_retry` (`gpt-5.4-mini`, low) dispatched on the same package.
+- Task 6 retry review: FAIL; fresh-connection unknown-commit recovery and realistic pipeline integration coverage required. Fix round 1 dispatched to original implementer `/root/r1_task6_replication`.
+- Task 6 fix round 1 commit `298bcb0`; scoped re-review `/root/r1_task6_rereview` (`gpt-5.4-mini`, low), package `review-863e3ac..298bcb0.diff`, PASS; both findings addressed, no new breakage.
+- Task 7 implementer: `/root/r1_task7_adapter` (`gpt-5.6-luna`, medium), brief `task-7-brief.md`, report `task-7-report.md`, BASE `298bcb0`; owns interrupted candidate but must commit only Task 7 files.
+- Task 7 reviewer: `/root/r1_task7_review` (`gpt-5.4-mini`, low), package `review-298bcb0..d9681ff.diff`, pending; unrelated formatter spill restored before review.
+- Task 7 review: FAIL; structured target+visible LSN proof and pure Studio bind parsing required. Fix round 1 dispatched to original implementer `/root/r1_task7_adapter`.
+- Task 7 fix round 1 commit `d313c74`; scoped re-review `/root/r1_task7_rereview` (`gpt-5.4-mini`, low), package `review-d9681ff..d313c74.diff`, PASS; both findings addressed with structured proof validation and process-local bind tests.
+- Task 8 implementer: `/root/r1_task8_clickhouse` (`gpt-5.6-sol`, ultra), brief `task-8-brief.md`, BASE `d313c74`; owns the interrupted ClickHouse candidate and must preserve uncommitted Task 9 files.
+- Task 8 first implementer terminated on platform usage limit before producing a commit or report; recovery implementer `/root/r1_task8_recovery` (`gpt-5.6-terra`, high) dispatched from the same BASE and ownership boundary.
+- Task 8 recovery implementation committed `bfa02b5`; focused ClickHouse tests 14/14 and ignored integration compile passed. Reviewer `/root/r1_task8_review` (`gpt-5.5`, high), package `review-d313c74..bfa02b5.diff`, pending.
+- Task 8 review: FAIL; critical history-loss layout plus important tombstone-duplicate and real `StreamDecoder` boundary gaps. Fix round 1 dispatched to `/root/r1_task8_recovery`; DDL conflict ruled in favor of spec section 8.
+- Task 8 fix round 1/5 (3 addressed, 0 open — version-preserving raw history, all-physical-row event duplicate validation, and transaction-complete `StreamDecoder` boundary; commits `bfa02b5`..`5ce4134`).
+- Task 8 scoped re-review `/root/r1_task8_rereview` (`gpt-5.4-mini`, medium), package `review-bfa02b5..5ce4134.diff`, PASS; no new Critical/Important breakage.
+- Task 9 implementer: `/root/r1_task9_oracle` (`gpt-5.6-terra`, high), brief `task-9-brief.md`, BASE `5ce4134`; formally owns and must audit the recovered uncommitted oracle/verdict candidates.
+- Task 9 implementation committed `4d2fb6d`; focused oracle/verdict tests 18/18, package check, and formatting passed. Reviewer `/root/r1_task9_review` (`gpt-5.5`, high), package `review-5ce4134..4d2fb6d.diff`, pending.
+- Task 9 review: FAIL; critical missing ledger-vs-PostgreSQL aggregate comparison, important reorder/invalidation propagation gaps, and two cross-task ownership findings. Fix round 1 dispatched to `/root/r1_task9_oracle` with rulings for Task 10 `RunResult` ownership and Task 11 R1 Compose path.
+- Task 9 fix round 1/5 (5 addressed, 1 parked by prior ruling — dual aggregate comparison, reorder detection, typed invalidations, Task10 helper ownership, and query alias; future R1 Compose path remains intentionally at `bench/r1/compose.yml`; commits `4d2fb6d`..`6242efa`). Scoped re-review `/root/r1_task9_rereview` (`gpt-5.4-mini`, medium), package `review-4d2fb6d..6242efa.diff`, PASS; no new Critical/Important breakage.
 
 ## Task status
 
@@ -106,14 +131,41 @@
 - Task 2: complete (commits `e5519e7`..`74e1358`; scoped re-review PASS after fix round 1)
 - Task 3: complete (commits `164e99d`..`c6078b2`, review clean after fix round 5)
 - Task 4: complete (commits `0bebe37`..`5b3d0ee`; scoped re-review PASS after fix round 1)
-- Task 5: complete (implementation `8f91358`; local fix round 1 and scoped re-review PASS)
-- Task 6: pending
-- Task 7: pending
-- Task 8: pending
-- Task 9: pending
+- Task 5: complete (commits `8f91358`..`225e32b`; cumulative re-review PASS)
+- Task 6: complete (commits `863e3ac`..`298bcb0`; scoped re-review PASS after fix round 1)
+- Task 7: complete (commits `d9681ff`..`d313c74`; scoped re-review PASS after fix round 1)
+- Task 8: complete (commits `bfa02b5`..`5ce4134`; scoped re-review PASS after fix round 1)
+- Task 9: complete (commits `4d2fb6d`..`6242efa`, 1 parked by ruling; scoped re-review PASS after fix round 1)
+- Task 10 implementer: pending dispatch from BASE `6242efa`; brief `task-10-brief.md`.
+- Task 10 implementation committed `ce14c58`; metrics/report tests 4/4 and package check passed, with workspace formatting drift reported outside scope. Reviewer `/root/r1_task10_review` (`gpt-5.4`, medium), package `review-6242efa..ce14c58.diff`, pending.
+- Task 10 review: FAIL; P1 raw metrics pipeline/artifact output absent, P1 AWS request loses measured-versus-scaled values, and P2 Markdown omits required evidence fields. Fix round 1 dispatched to original implementer `/root/r1_task10_metrics`.
+- Task 10 fix round 1/5 (3 addressed, 0 open — raw metrics collectors/artifact, measured-vs-scaled AWS capacity, and complete Markdown evidence; commits `ce14c58`..`15a3439`). Scoped re-review `/root/r1_task10_rereview` (`gpt-5.4-mini`, medium), package `review-ce14c58..15a3439.diff`, pending.
+- Task 10 scoped re-review: original 3 findings addressed, but new P1 found raw metrics serialized into summary `result.json`; fix round 2 dispatched to original implementer `/root/r1_task10_metrics`.
+- Task 10 fix round 2/5 (1 addressed, 0 open — raw metrics now serde-skipped from result summary with artifact regression; commits `15a3439`..`20bf2e5`). Scoped re-review `/root/r1_task10_rereview2` (`gpt-5.4-mini`, low), package `review-15a3439..20bf2e5.diff`, pending.
+- Task 10 complete (commits `ce14c58`..`20bf2e5`; 2 fix rounds, scoped re-reviews PASS).
+- Task 11 implementer: pending dispatch from BASE `20bf2e5`; brief `task-11-brief.md`.
+- Task 11 implementation committed `0f98db4`; bash/Compose contract/Rustfmt/diff checks passed; Docker Compose unavailable so live gates deferred. Reviewer `/root/r1_task11_review` (`gpt-5.4`, medium), package `review-20bf2e5..0f98db4.diff`, pending.
+- Task 11 review: FAIL; P1 running-profile shape/context validation and host `r1ctl` build hook missing, P2 Compose contract omits ports/images/anonymous-volume assertions. Fix round 1 dispatched to `/root/r1_task11_compose`.
+- Task 11 fix round 1/5 (3 addressed, 0 open — profile shape/context validation, safe deferred host CLI build hook, and complete Compose contract; commits `0f98db4`..`ad92092`). Scoped re-review `/root/r1_task11_rereview` (`gpt-5.4-mini`, medium), package `review-0f98db4..ad92092.diff`, pending.
+- Task 11 complete (commits `0f98db4`..`ad92092`; scoped re-review PASS after fix round 1; Compose CLI/live services deferred by environment availability).
+- Task 12 implementer: pending dispatch from BASE `ad92092`; brief `task-12-brief.md`.
 - Task 10: pending
-- Task 11: pending
-- Task 12: pending
+- Task 10: complete (commits `ce14c58`..`20bf2e5`; scoped re-reviews PASS after fix rounds 1-2)
+- Task 11: in progress (implementation committed; review pending)
+- Task 11: complete (commits `0f98db4`..`ad92092`; scoped re-review PASS after fix round 1)
+- Task 12 implementation committed `cda8cb3`; controller/failure/CLI focused tests 12/12, all-target check and scoped formatting/diff checks passed. Reviewer `/root/r1_task12_review` (`gpt-5.5`, high), package `review-ad92092..cda8cb3.diff`, pending.
+- Task 12 review: FAIL; two Critical lifecycle/replay omissions, four Important CLI/failure/durability gaps, and one Minor scheduler coverage gap. Fix round 1 dispatched to original implementer `/root/r1_task12_controller`.
+- Task 12 fix round 1/5 (7 addressed, 0 open — runtime lifecycle, isolated replay, invalid archival, real mutation fixtures, failure evidence, durable starts, and scheduler/stop coverage; commits `cda8cb3`..`47d6185`). Scoped re-review `/root/r1_task12_rereview` (`gpt-5.4`, high), package `review-cda8cb3..47d6185.diff`, pending.
+- Task 12 scoped re-review: findings 3/4/6 addressed; 1/2/5/7 partial, with new Important persisted-plan-config and real-elapsed-duration regressions. Fix round 2 dispatched to original implementer `/root/r1_task12_controller`.
+- Task 12 fix round 2/5 (2 addressed, 0 open for its targeted regressions — persisted plan configuration and real elapsed duration; commits `47d6185`..`edf0315`). Scoped re-review could not complete due platform usage limit; authoritative review identified remaining runtime/lifecycle gaps, so round 3 is dispatched to the original implementer.
+- Task 12 fix round 3: original implementer reported BLOCKED because the concrete multi-engine runtime bridge is absent; no changes made. Per SDD escalation, fresh architecture worker `/root/r1_task12_runtime_escalation` (`gpt-5.6-sol`, ultra) owns fix round 4 from BASE `edf0315`.
+- Task 12 fix round 4: escalation worker hit the platform usage limit mid-round, leaving uncommitted runtime work; controller took over, audited, and completed the round. Concrete `runtime::MacComposeRuntime` (all 15 stages, measured Q1-Q5 windows, rate search, isolated replay binding, exit-75 restart) is now wired into every `r1ctl` subcommand, replacing the fail-closed adapter; legacy `plan: None` runs are invalidated with an exact reason and archived via report/checksums only; writer-restart proof validates missing/duplicate/reorder/catch-up on both engines.
+- Task 12 round-4 scoped re-review: FAIL; prior findings 1-5 verified fixed, but new Critical per-engine correctness checkpoint capture raced the writer (deterministic Cdc300 abort), and Important exit-75 never reached the process boundary. Fix: single-capture ledger-derived shared checkpoint for correctness mode (regression test with racy fake), `exit_code_for` maps RestartRequired→75 in `r1ctl` main; minors — planless archived results carry `profile: None`, rate ladder deduplicated into `controller::search_rates`, parked received-LSN and freshness p50/p95 with explicit comments. Round-4b scoped re-review: PASS (all fixes verified, no new breakage; two Minor notes addressed or annotated).
+- Final gate evidence: workspace 33 suites 0 failures; lib 87 + bin 1; controller_state 12; runtime_lifecycle 3; r1ctl 4; fmt PASS; clippy 34 warnings identical to edf0315 baseline (0 from round-4 code); check --all-targets PASS; git diff --check PASS; release `self-test-invalidations` PASS. Live 1 GiB rehearsal remains separately authorized.
+- Parked-gap fix round (`de4863b`): fixed three gaps that would have distorted the measured benchmark. (1) Dead freshness gate — Studio exposes no `lag_ms`, so freshness p99 was always 0 and the spec's p99>1000ms stop rule could never fire; freshness is now computed in real ms from ledger commit times per query/rate-observation/report percentile. (2) O(entire-file) ledger/map rescans per query iteration and per 20ms CDC poll — replaced with byte-offset incremental `refresh()` plus cached read views. (3) `received_lsn` was fabricated from `applied_lsn` — now parsed from Studio's real field. Scoped re-review: PASS; 8 new tests; all gates green (95 lib / 12 / 3 / 4 / 1; fmt, clippy baseline-identical, diff-check PASS).
+- Live environment round (`3d9051a`): Colima r1 profile is live (8 CPU/12 GiB/600 GiB on the external disk; spaced-path virtiofs share requires lima >= 2.2.0) and all three Compose services are healthy. All deferred `#[ignore]`d integration suites executed against real services and PASS: postgres_dataset (two 64 MiB loads, identical content hash), postgres_workload (100 txns + unknown-commit recovery + replay integrity), clickhouse_cdc (exact-at-LSN roundtrip, pgoutput buffering, retry/restart dedup). Five live-only defects fixed: content hash poisoned by per-load WAL position/physical bytes; jsonb `String` binding failures (`$n::text::jsonb`); `--` comment semicolons producing "Empty query" statements; `non_replicated_deduplication_window` moved from request-level (rejected by 25.8, server default 0 = dedup off) to table-level DDL; miscounted shipped-row fixture expectations. Also fixed `scripts/r1-colima.sh` awk word-splitting on spaced paths and the RepoDigests tag matcher.
+- Task 12: complete pending live rehearsal authorization (fix rounds 1-4, 4b, parked-gap round; scoped re-reviews FAIL→PASS→PASS)
+- 1 GiB rehearsal (authorized, in progress): live stack healthy; stages Preflight→Seed→Baseline→Bootstrap→InitialCheckpoint→Warmup→Quiet all PASS with three-engine digest agreement at one LSN. Nine live-only defects fixed across commits `3d9051a`..`4c7dd0e` (preflight lock self-collision; ANALYZE-bound seed loader 1446s→50s/64MiB; pg_basebackup install + conninfo; managed pg_hba for replication; ClickHouse postgresql() schema argument; checkpoint target below engine slot boundary; GrayDB missing `r1` schema registration + drained-stream proof; CH 25.8 idle-visibility sentinel; canonical digest hashing column names and name-ranked ordering — now positional values only; settle watermark for timed stages; checksums exclude services/). OPEN finding: CH CDC apply capped ~10 txns/s (serial per-commit HTTP) vs ~250 txn/s required at Cdc300 — needs a micro-batching design change (next work item). Workspace 33×0 failures after compose-contract adjustment; env remains live.
 - Task 13: pending
 
 ## Task 1 execution

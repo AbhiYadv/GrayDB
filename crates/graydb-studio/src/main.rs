@@ -107,7 +107,24 @@ async fn query(State(e): Eng, Json(req): Json<QueryReq>) -> impl IntoResponse {
                 .class
                 .strip_prefix("target_lsn=")
                 .and_then(|value| graydb_ingest::repl::parse_lsn(value.trim()).ok());
-            let visible_lsn = graydb_ingest::repl::parse_lsn(&status.applied_lsn).ok();
+            // Machine visibility contract: the state is complete through
+            // `applied_lsn` normally, and through `received_lsn` when the
+            // decode queue is drained (frames == 0) — between publication
+            // commits, applied parks at the last commit while the source
+            // WAL advances on non-published records.
+            let applied_lsn = graydb_ingest::repl::parse_lsn(&status.applied_lsn).ok();
+            let visible_lsn = if status.frames == 0 {
+                match (
+                    applied_lsn,
+                    graydb_ingest::repl::parse_lsn(&status.received_lsn).ok(),
+                ) {
+                    (Some(applied), Some(received)) => Some(applied.max(received)),
+                    (applied, None) => applied,
+                    (None, received) => received,
+                }
+            } else {
+                applied_lsn
+            };
             Json(json!({
                 "columns": cols,
                 "rows": rows,

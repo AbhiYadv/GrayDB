@@ -131,6 +131,11 @@ pub async fn run_query(
     catalog
         .register_schema("graydb", Arc::new(MemorySchemaProvider::new()))
         .map_err(anyhow_df)?;
+    // Columnar table names carry their PostgreSQL schema ("r1.orders"); the
+    // schema must exist for the dotted registrations below to resolve.
+    catalog
+        .register_schema("r1", Arc::new(MemorySchemaProvider::new()))
+        .map_err(anyhow_df)?;
 
     let mut shapes: Vec<(String, u64)> = Vec::new();
     for snap in snapshots {
